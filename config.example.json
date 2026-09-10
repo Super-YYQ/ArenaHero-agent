@@ -1,0 +1,7 @@
+{
+  "api_key": "在这里填入你的 Arena Hero API Key",
+  "max_workers": 10,
+  "max_vanguards": 2,
+  "min_spawn_reserve": 0,
+  "log_level": "INFO"
+}

@@ -1,0 +1,19 @@
+# 密钥与本地运行产物，禁止进仓库
+config.json
+memory.json
+agent.log
+run_output.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.tmp
