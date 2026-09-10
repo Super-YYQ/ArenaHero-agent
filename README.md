@@ -59,3 +59,40 @@ python test_strategy.py
 侦察选点参考社区成熟方案 [Drew-Z/arena-hero-agent](https://github.com/Drew-Z/arena-hero-agent)：按区块覆盖时间去扫最久未见的区块，而不是朝一个远点走直线。资源按区块配额刷新，扫过才知道有没有点。
 
 Vanguard 平时贴 Core 蹲守，邻格有敌则 SWEEP；Worker 遭遇敌人向 Core 撤退。不主动抢 Beacon。
+
+## 参考
+
+### 官方
+
+| | |
+|---|---|
+| 游戏 | [app.arenahero.io](https://app.arenahero.io/) |
+| 规则与 API | [doc.arenahero.io/zh-Hans](https://doc.arenahero.io/zh-Hans/) |
+| 世界与 Tick | [rules/world-and-ticks](https://doc.arenahero.io/zh-Hans/rules/world-and-ticks) |
+| 规则速查 | [reference/numbers](https://doc.arenahero.io/zh-Hans/reference/numbers) |
+| Python SDK | [sdk/quickstart](https://doc.arenahero.io/zh-Hans/sdk/quickstart) · 包名 `arena-hero` |
+| 原始 API | [agent/quickstart](https://doc.arenahero.io/zh-Hans/agent/quickstart) |
+| 游戏介绍帖 | [linux.do/t/topic/2703804](https://linux.do/t/topic/2703804) |
+
+### 社区 Agent / 经验（侦察与发育参考）
+
+| | |
+|---|---|
+| Drew-Z 无人值守 Agent（本仓库侦察策略主要来源） | [github.com/Drew-Z/arena-hero-agent](https://github.com/Drew-Z/arena-hero-agent) · [介绍帖](https://linux.do/t/topic/2703873) |
+| 新手快速上路 / 踩坑复盘 | [linux.do/t/topic/2706070](https://linux.do/t/topic/2706070) |
+| 其他开源 Agent | [linux.do/t/topic/2726683](https://linux.do/t/topic/2726683) |
+| 进化框架（含可部署 Agent） | [linux.do/t/topic/2723397](https://linux.do/t/topic/2723397) |
+| Agent 评测与模拟器 | [linux.do/t/topic/2757655](https://linux.do/t/topic/2757655) |
+
+Drew-Z 仓库里我们**已经用上**的：16 方向 × 4 环侦察、按区块 `last_seen` 选点、HARVEST 失败冷却、卡住换目标。
+
+**还没搬、值得下一步做的**（按收益大致排序）：
+
+1. **A\* 寻路** — 现在是单步贪心，绕复杂障碍会抖；走不通才换目标，远点经常绕路失败。
+2. **匈牙利算法分配资源** — Worker 多了之后「就近认领」会撞车；最小费用匹配 + 粘性奖励更稳。
+3. **Worker 冲到 18** — 人口 0–19 是基础价，社区发育流默认打满这段再转兵。
+4. **Core 容量缓冲** — 留 10 点空仓，避免掉两个 Unit 后容量下降把库存销毁。
+5. **威胁分级** — 看见敌人不是只让 Worker 跑：预估伤害、Vanguard 拦截、必要时 Core 迁移或自毁重生。
+6. **开机自启** — Windows 任务计划 / 已有社区方案的 Docker + systemd，关终端也不停。
+
+不在近期范围：抢 Beacon、主动进攻、Ranger 风筝。当前目标仍是稳定攒资源。
