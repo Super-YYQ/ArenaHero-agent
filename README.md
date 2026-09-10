@@ -2,7 +2,7 @@
 
 Arena Hero 经济流无人值守 Agent：Worker 采集资源、Core 滚雪球生产，少量 Vanguard 守家。
 
-游戏：[app.arenahero.io](https://app.arenahero.io/) · 规则：[doc.arenahero.io](https://doc.arenahero.io/zh-Hans/)
+游戏：[app.arenahero.io](https://app.arenahero.io/) · 规则：[doc.arenahero.io](https://doc.arenahero.io/zh-Hans/) · 本地摘录：[ArenaHero规则全文.md](ArenaHero规则全文.md)
 
 ## 做什么
 
