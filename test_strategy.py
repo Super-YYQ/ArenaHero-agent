@@ -64,6 +64,32 @@ def test_loaded_worker_returns_to_core():
     assert args[0] in ("UP", "LEFT")
 
 
+def test_loaded_worker_does_not_reverse():
+    """满载回城也不能走进刚离开的格子，否则会和对面友军对撞换位。"""
+    w = {"id": "w1", "pos": (2, 0), "cargo": 1, "last_pos": (1, 0)}
+    action, args = decide_worker(w, (0, 0), {}, set(), set(), set())
+    assert action == "move"
+    assert args[0] != "LEFT"
+
+
+def test_two_loaded_workers_do_not_swap():
+    """相邻满载 Worker 回城时，不能互换格子。"""
+    from strategy import DELTA
+    core = (0, 0)
+    a = {"id": "a", "pos": (1, 2), "cargo": 1}
+    b = {"id": "b", "pos": (1, 1), "cargo": 1}
+    obstacles = {(0, 1), (1, 0)}
+    occupied = {core, a["pos"], b["pos"]}
+    action_a, args_a = decide_worker(a, core, {}, obstacles, occupied, set())
+    assert action_a == "move"
+    dest_a = (a["pos"][0] + DELTA[args_a[0]][0], a["pos"][1] + DELTA[args_a[0]][1])
+    occupied.add(dest_a)
+    action_b, args_b = decide_worker(b, core, {}, obstacles, occupied, set())
+    assert action_b == "move"
+    dest_b = (b["pos"][0] + DELTA[args_b[0]][0], b["pos"][1] + DELTA[args_b[0]][1])
+    assert not (dest_a == b["pos"] and dest_b == a["pos"]), "相邻 Worker 互换了格子"
+
+
 def test_worker_deposits_on_core_cell():
     w = {"id": "w1", "pos": (0, 0), "cargo": 2}
     action, _ = decide_worker(w, (0, 0), {}, set(), set(), set())
@@ -129,15 +155,18 @@ def test_chunk_of():
 
 
 def test_scout_picks_least_recently_seen_chunk():
-    """没有资源时，目标应落在最久没扫过的区块中心附近。"""
-    from strategy import pick_scout_target, chunk_of
+    """近处航点都扫过之后，应去更久未见的外圈区块，而不是反复扫家门口。"""
+    from strategy import pick_scout_target, _scout_points, SCOUT_RING_STEP
     core = (0, 0)
-    # 原点区块刚看过，东边区块从未看过 → 应选东边
     last_seen = {(0, 0): 100}
-    claimed = set()
-    target = pick_scout_target(core, last_seen, claimed, slot=0, tick=100)
-    assert chunk_of(target) != (0, 0), f"不应再扫刚看过的原点区块, got {target}"
-    assert target not in claimed
+    waypoints = {}
+    for _, cand in _scout_points(core):
+        dist = abs(cand[0] - core[0]) + abs(cand[1] - core[1])
+        if dist <= SCOUT_RING_STEP + 1:
+            waypoints[cand] = 100
+    target = pick_scout_target(core, last_seen, set(), slot=0, tick=100, waypoint_last_seen=waypoints)
+    assert target not in waypoints, f"近处航点扫完后不应再去, got {target}"
+    assert abs(target[0]) + abs(target[1]) > SCOUT_RING_STEP
 
 
 def test_scout_avoids_claimed_targets():
@@ -148,6 +177,153 @@ def test_scout_avoids_claimed_targets():
     claimed.add(t1)
     t2 = pick_scout_target(core, {}, claimed, slot=1, tick=1)
     assert t1 != t2
+
+
+def test_worker_waits_when_on_explore_target():
+    """到了侦察点应停下，让下一 Tick 换目标；不能沿远离 Core 方向继续走。"""
+    w = {"id": "w1", "pos": (5, 0), "cargo": 0, "explore_target": (5, 0)}
+    action, _ = decide_worker(w, (0, 0), {}, set(), set(), set())
+    assert action == "wait"
+
+
+def test_two_idle_workers_scout_different_quadrants():
+    """两个空闲 Worker 不能都挤在东/东南近处。"""
+    from strategy import assign_explore_targets, StrategyState
+    core = (0, 0)
+    state = StrategyState()
+    workers = [
+        {"id": "w1", "pos": (0, 0), "cargo": 0},
+        {"id": "w2", "pos": (0, 0), "cargo": 0},
+    ]
+    assign_explore_targets(workers, {}, core, state, tick=1)
+    t1 = workers[0]["explore_target"]
+    t2 = workers[1]["explore_target"]
+    assert t1 != t2
+    q1 = (t1[0] - core[0] >= 0, t1[1] - core[1] >= 0)
+    q2 = (t2[0] - core[0] >= 0, t2[1] - core[1] >= 0)
+    assert q1 != q2, f"两个 Worker 落在同一象限: {t1} {t2}"
+
+
+def test_scout_does_not_reassign_cell_just_arrived():
+    """到达侦察点后，下一个目标不能还是当前格。"""
+    from strategy import assign_explore_targets, StrategyState, chunk_of
+    core = (0, 0)
+    state = StrategyState()
+    here = (10, 0)
+    workers = [{"id": "w1", "pos": here, "cargo": 0}]
+    state.explore_targets["w1"] = here
+    state.scout_slots["w1"] = 0
+    state.chunk_last_seen[chunk_of(here)] = 50
+    assign_explore_targets(workers, {}, core, state, tick=50)
+    assert workers[0]["explore_target"] != here
+
+
+def test_repeated_scout_picks_cover_north():
+    """连续换目标应扫到北侧（y 小于 Core），不能永远停在南/东。"""
+    from strategy import assign_explore_targets, StrategyState, chunk_of
+    core = (0, 0)
+    state = StrategyState()
+    workers = [{"id": "w1", "pos": (0, 0), "cargo": 0}]
+    saw_north = False
+    for tick in range(1, 9):
+        prev = workers[0].get("explore_target")
+        if prev is not None:
+            workers[0]["pos"] = prev
+            state.chunk_last_seen[chunk_of(prev)] = tick
+        assign_explore_targets(workers, {}, core, state, tick)
+        target = workers[0]["explore_target"]
+        if target[1] < core[1]:
+            saw_north = True
+    assert saw_north, "8 次重选应至少有一次朝北"
+
+
+def test_repeated_scout_covers_north_when_core_near_chunk_south():
+    """Core 贴着区块南沿时（实战常见），也不能只往南/东扫。"""
+    from strategy import assign_explore_targets, StrategyState, chunk_of
+    core = (11, 25)  # 区块 (0,0) 内距南沿 6 格、距北沿 25 格
+    state = StrategyState()
+    workers = [{"id": "w1", "pos": core, "cargo": 0}]
+    saw_north = False
+    for tick in range(1, 9):
+        prev = workers[0].get("explore_target")
+        if prev is not None:
+            workers[0]["pos"] = prev
+            state.chunk_last_seen[chunk_of(prev)] = tick
+        assign_explore_targets(workers, {}, core, state, tick)
+        if workers[0]["explore_target"][1] < core[1]:
+            saw_north = True
+    assert saw_north, "Core 靠南时 8 次重选也应朝北"
+
+
+def test_scout_does_not_steal_inflight_target():
+    """还在路上的侦察目标不能被刚到点的另一个 Worker 抢走。
+
+    w1 到点后槽位变成 1，偏好朝向 (1,-1) 的最近点是 (5,-5)；
+    若不清点就重选，会把 w2 正在走的 (5,-5) 抢走。
+    """
+    from strategy import assign_explore_targets, StrategyState
+    core = (0, 0)
+    inflight = (5, -5)
+    state = StrategyState()
+    state.explore_targets["w1"] = (10, 0)
+    state.scout_slots["w1"] = 0
+    state.explore_targets["w2"] = inflight
+    state.scout_slots["w2"] = 7
+    workers = [
+        {"id": "w1", "pos": (10, 0), "cargo": 0},
+        {"id": "w2", "pos": (0, 0), "cargo": 0},
+    ]
+    assign_explore_targets(workers, {}, core, state, tick=1)
+    assert workers[1]["explore_target"] == inflight
+    assert workers[0]["explore_target"] != inflight
+
+
+def test_scout_prefers_near_unseen_over_far_heading():
+    """家区块已扫过时，应先去近处未见（西侧约 20），不能因槽位偏好东边而跑到 30+。"""
+    from strategy import pick_scout_target, chunk_of
+    core = (11, 25)
+    last_seen = {chunk_of(core): 50}
+    target = pick_scout_target(core, last_seen, set(), slot=0, tick=50)
+    dist = abs(target[0] - core[0]) + abs(target[1] - core[1])
+    assert dist <= 20, f"近处未见优先，got {target} dist={dist}"
+
+
+def test_scout_skips_obstacle_waypoints():
+    """障碍格不能当侦察目标。"""
+    from strategy import pick_scout_target
+    core = (0, 0)
+    obstacles = {(10, 0), (5, 5), (0, 10), (-5, 5), (-10, 0), (-5, -5), (0, -10), (5, -5)}
+    target = pick_scout_target(core, {}, set(), slot=0, tick=1, obstacles=obstacles)
+    assert target not in obstacles
+
+
+def test_blocked_explore_target_is_abandoned():
+    """正在走的侦察点若是障碍，立刻换目标，不要围着墙转。"""
+    from strategy import assign_explore_targets, StrategyState
+    core = (0, 0)
+    blocked = (0, -30)
+    state = StrategyState()
+    state.explore_targets["w1"] = blocked
+    state.scout_slots["w1"] = 6
+    workers = [{"id": "w1", "pos": (0, -28), "cargo": 0}]
+    assign_explore_targets(workers, {}, core, state, tick=1, obstacles={blocked})
+    assert workers[0]["explore_target"] != blocked
+
+
+def test_no_progress_abandons_explore_target():
+    """曼哈顿距离一直不缩短（来回徘徊）应换目标，即使每 Tick 都在 move。"""
+    from strategy import assign_explore_targets, StrategyState, SCOUT_NO_PROGRESS_TICKS
+    core = (0, 0)
+    target = (10, 0)
+    state = StrategyState()
+    state.explore_targets["w1"] = target
+    state.scout_slots["w1"] = 0
+    workers = [{"id": "w1", "pos": (5, 0), "cargo": 0}]
+    for tick in range(1, SCOUT_NO_PROGRESS_TICKS + 2):
+        # 在目标旁等距徘徊：距离不变，不能算作接近
+        workers[0]["pos"] = (5, 1 if tick % 2 else -1)
+        assign_explore_targets(workers, {}, core, state, tick)
+    assert workers[0]["explore_target"] != target
 
 
 def test_assign_skips_cooled_resource():

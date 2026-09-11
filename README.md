@@ -7,9 +7,9 @@ Arena Hero 经济流无人值守 Agent：Worker 采集资源、Core 滚雪球生
 ## 做什么
 
 - 空载 Worker 认领最近已知资源点，采满回 Core 交付
-- 没有资源时按 **16 方向 × 4 环** 侦察最久没扫过的 32×32 区块
+- 没有资源时按 **16 方向 × 4 环航点** 侦察：没去过的近处优先，障碍格跳过；到点、卡住或绕圈无进展则换目标
 - 资源够就造 Worker（上限可配，默认 10）；3 个 Worker 后造最多 2 个 Vanguard 自卫
-- HARVEST_FAILED 后该格子冷却 8 Tick；卡住 3 Tick 换侦察目标；禁止回头，避免 2 格振荡
+- HARVEST_FAILED 后该格子冷却 8 Tick；卡住 3 Tick 换侦察目标；到点停下再换目标，禁止回头，避免 2 格振荡
 - 断线 5 秒自动重连；障碍/资源记忆落盘 `memory.json`
 
 浏览器不用开。Agent 走官方 HTTP + WebSocket API，跟网页前端完全独立。
@@ -84,7 +84,7 @@ Vanguard 平时贴 Core 蹲守，邻格有敌则 SWEEP；Worker 遭遇敌人向 
 | 进化框架（含可部署 Agent） | [linux.do/t/topic/2723397](https://linux.do/t/topic/2723397) |
 | Agent 评测与模拟器 | [linux.do/t/topic/2757655](https://linux.do/t/topic/2757655) |
 
-Drew-Z 仓库里我们**已经用上**的：16 方向 × 4 环侦察、按区块 `last_seen` 选点、HARVEST 失败冷却、卡住换目标。
+Drew-Z 仓库里我们**已经用上**的：16 方向 × 4 环侦察、按区块 `last_seen` 选点、HARVEST 失败冷却、卡住换目标。选点改为全方向候选 + 到点换朝向，避免多人锁在东/东南近处打转。
 
 **还没搬、值得下一步做的**（按收益大致排序）：
 

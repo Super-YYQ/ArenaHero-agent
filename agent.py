@@ -17,14 +17,12 @@ from memory import MapMemory
 from strategy import (
     DELTA,
     RESOURCE_COOLDOWN_TICKS,
-    SCOUT_STALL_TICKS,
     StrategyState,
+    assign_explore_targets,
     assign_resources,
     chunk_of,
     decide_vanguard,
     decide_worker,
-    pick_scout_target,
-    should_abandon_scout,
 )
 
 HERE = Path(__file__).parent
@@ -149,6 +147,10 @@ class Agent:
         occupied = {core_pos} if core_pos else set()
         for e in enemies:
             occupied.add(e["pos"])
+        for wdict in workers:
+            occupied.add(wdict["pos"])
+        for vdict in vanguards:
+            occupied.add(vdict["pos"])
         if core is None:
             return
 
@@ -173,34 +175,9 @@ class Agent:
 
         # 没有资源任务的 Worker：环形侦察，目标选最久没扫过的区块。
         # 卡住 SCOUT_STALL_TICKS 或到达目标 → 换下一个。
-        self.strat.scout_claims.clear()
-        for wdict in workers:
-            wid = wdict["id"]
-            wdict["last_pos"] = self.strat.last_pos.get(wid)
-            if wid in assignment or wdict["cargo"] > 0:
-                self.strat.explore_targets.pop(wid, None)
-                self.strat.stall_count[wid] = 0
-                continue
-            if wid not in self.strat.scout_slots:
-                self.strat.scout_slots[wid] = self.strat.next_scout_slot
-                self.strat.next_scout_slot += 1
-            stalled = self.strat.stall_count.get(wid, 0)
-            target = self.strat.explore_targets.get(wid)
-            arrived = target is not None and wdict["pos"] == target
-            if target is None or arrived or should_abandon_scout(stalled):
-                if target is not None:
-                    self.strat.scout_claims.discard(target)
-                target = pick_scout_target(
-                    core_pos,
-                    self.strat.chunk_last_seen,
-                    self.strat.scout_claims,
-                    self.strat.scout_slots[wid],
-                    tick,
-                )
-                self.strat.explore_targets[wid] = target
-                self.strat.stall_count[wid] = 0
-            self.strat.scout_claims.add(target)
-            wdict["explore_target"] = target
+        assign_explore_targets(
+            workers, assignment, core_pos, self.strat, tick, obstacles=obstacles,
+        )
 
         # ---- Worker 行动 ----
         for w, wdict in zip(turn.workers, workers):

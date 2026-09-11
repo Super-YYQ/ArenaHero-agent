@@ -97,6 +97,12 @@ class StrategyState:
     # worker_id -> 侦察槽位（稳定，不随列表顺序变）
     scout_slots: dict[str, int] = field(default_factory=dict)
     next_scout_slot: int = 0
+    # worker_id -> 当前侦察目标上见过的最短曼哈顿距离
+    scout_best_dist: dict[str, int] = field(default_factory=dict)
+    # worker_id -> 距离没有缩短的连续 tick 数
+    no_progress_count: dict[str, int] = field(default_factory=dict)
+    # 侦察航点 -> 最后一次到达/放弃的 tick；按点记，避免 32×32 把近处西侧误判成已扫
+    waypoint_last_seen: dict[tuple[int, int], int] = field(default_factory=dict)
 
 
 # 16 方向 × 4 环，半径 10/20/30/40。社区成熟方案（Drew-Z arena-hero-agent）。
@@ -109,6 +115,7 @@ SCOUT_VECTORS = (
 SCOUT_RING_STEP = 10
 SCOUT_RING_COUNT = 4
 SCOUT_STALL_TICKS = 3
+SCOUT_NO_PROGRESS_TICKS = 6
 RESOURCE_COOLDOWN_TICKS = 8
 CHUNK_SIZE = 32
 
@@ -124,48 +131,162 @@ def should_abandon_scout(stall: int, stall_limit: int = SCOUT_STALL_TICKS) -> bo
     return stall >= stall_limit
 
 
+def _heading_delta(a: int, b: int) -> int:
+    d = abs(a - b) % len(SCOUT_VECTORS)
+    return min(d, len(SCOUT_VECTORS) - d)
+
+
+def _scout_points(core_pos: tuple[int, int]):
+    """16 方向 × 4 环的全部候选，附带朝向下标。"""
+    for hi, heading in enumerate(SCOUT_VECTORS):
+        for ring_offset in range(SCOUT_RING_COUNT):
+            radius = SCOUT_RING_STEP * (1 + ring_offset)
+            scale = max(1, radius // (abs(heading[0]) + abs(heading[1])))
+            cand = (core_pos[0] + heading[0] * scale, core_pos[1] + heading[1] * scale)
+            yield hi, cand
+
+
 def pick_scout_target(
     core_pos: tuple[int, int],
     chunk_last_seen: dict[tuple[int, int], int],
     claimed: set[tuple[int, int]],
     slot: int,
     tick: int,
+    avoid: set[tuple[int, int]] | None = None,
+    obstacles: set[tuple[int, int]] | None = None,
+    waypoint_last_seen: dict[tuple[int, int], int] | None = None,
 ) -> tuple[int, int]:
-    """从 16 方向 × 4 环的候选里挑一个：最久没扫过的区块优先，其次未占用。"""
-    vectors = SCOUT_VECTORS
-    base_ring = 1 + slot // len(vectors)
-    heading = vectors[slot % len(vectors)]
-    candidates: list[tuple[int, int]] = []
-    for ring_offset in range(SCOUT_RING_COUNT):
-        radius = SCOUT_RING_STEP * (base_ring + ring_offset)
-        scale = max(1, radius // (abs(heading[0]) + abs(heading[1])))
-        cand = (core_pos[0] + heading[0] * scale, core_pos[1] + heading[1] * scale)
-        if cand in claimed:
+    """从全部 16 方向 × 4 环里挑：没去过的航点优先，同龄时近的优先。
+
+    槽位只在同龄同距里打散朝向（slot*7 mod 16）。
+    障碍格不当目标。avoid 只排除格子本身，不整块丢掉近处西侧。
+    chunk_last_seen / tick 保留给调用方，选点按航点记忆。
+    """
+    avoid = avoid or set()
+    obstacles = obstacles or set()
+    waypoint_last_seen = waypoint_last_seen or {}
+    preferred = (slot * 7) % len(SCOUT_VECTORS)
+    blocked = claimed | avoid | obstacles
+    candidates: list[tuple[int, tuple[int, int]]] = []
+    for hi, cand in _scout_points(core_pos):
+        if cand in blocked:
             continue
-        candidates.append(cand)
-    # 同一 Worker 槽位的主方向被占时，绕一圈其他方向再找
+        candidates.append((hi, cand))
     if not candidates:
-        for v in vectors:
-            for ring_offset in range(SCOUT_RING_COUNT):
-                radius = SCOUT_RING_STEP * (1 + ring_offset)
-                scale = max(1, radius // (abs(v[0]) + abs(v[1])))
-                cand = (core_pos[0] + v[0] * scale, core_pos[1] + v[1] * scale)
-                if cand not in claimed:
-                    candidates.append(cand)
-                    break
-            if candidates:
+        for hi, cand in _scout_points(core_pos):
+            if cand not in blocked:
+                candidates.append((hi, cand))
                 break
     if not candidates:
-        return (core_pos[0] + SCOUT_RING_STEP, core_pos[1])
+        fallback = (core_pos[0] + SCOUT_RING_STEP, core_pos[1])
+        if fallback not in obstacles:
+            return fallback
+        for hi, cand in _scout_points(core_pos):
+            if cand not in obstacles:
+                return cand
+        return fallback
 
-    def score(cand: tuple[int, int]) -> tuple:
-        ch = chunk_of(cand)
-        last = chunk_last_seen.get(ch, -1)
+    def score(item: tuple[int, tuple[int, int]]) -> tuple:
+        hi, cand = item
+        wp = waypoint_last_seen.get(cand, -1)
         dist = abs(cand[0] - core_pos[0]) + abs(cand[1] - core_pos[1])
-        # 最久未见优先（last 越小越好），同龄时近的优先
-        return (last, dist)
+        # 没去过的航点 → 近处优先 → 朝向只打散并列
+        return (wp, dist, _heading_delta(hi, preferred))
 
-    return min(candidates, key=score)
+    return min(candidates, key=score)[1]
+
+
+def _manhattan(a: tuple[int, int], b: tuple[int, int]) -> int:
+    return abs(a[0] - b[0]) + abs(a[1] - b[1])
+
+
+def assign_explore_targets(
+    workers: list[dict],
+    assignment: dict[str, tuple[int, int]],
+    core_pos: tuple[int, int],
+    state: StrategyState,
+    tick: int,
+    obstacles: set[tuple[int, int]] | None = None,
+) -> None:
+    """给没有资源任务的空载 Worker 分配环形侦察目标。原地改 workers 与 state。"""
+    obstacles = obstacles or set()
+
+    def reset_progress(wid: str) -> None:
+        state.stall_count[wid] = 0
+        state.no_progress_count.pop(wid, None)
+        state.scout_best_dist.pop(wid, None)
+
+    def should_drop(wid: str, wdict: dict, target: tuple[int, int] | None) -> bool:
+        if target is None:
+            return True
+        if wdict["pos"] == target or target in obstacles:
+            return True
+        if should_abandon_scout(state.stall_count.get(wid, 0)):
+            return True
+        dist = _manhattan(wdict["pos"], target)
+        best = state.scout_best_dist.get(wid)
+        if best is None:
+            return False
+        stuck = dist >= best and state.no_progress_count.get(wid, 0) + 1 >= SCOUT_NO_PROGRESS_TICKS
+        return stuck
+
+    def track_progress(wid: str, wdict: dict, target: tuple[int, int]) -> None:
+        dist = _manhattan(wdict["pos"], target)
+        best = state.scout_best_dist.get(wid)
+        if best is None or dist < best:
+            state.scout_best_dist[wid] = dist
+            state.no_progress_count[wid] = 0
+        else:
+            state.no_progress_count[wid] = state.no_progress_count.get(wid, 0) + 1
+
+    state.scout_claims.clear()
+    for wdict in workers:
+        wid = wdict["id"]
+        if wid in assignment or wdict["cargo"] > 0:
+            continue
+        target = state.explore_targets.get(wid)
+        if should_drop(wid, wdict, target):
+            continue
+        state.scout_claims.add(target)
+
+    for wdict in workers:
+        wid = wdict["id"]
+        wdict["last_pos"] = state.last_pos.get(wid)
+        if wid in assignment or wdict["cargo"] > 0:
+            state.explore_targets.pop(wid, None)
+            reset_progress(wid)
+            continue
+        if wid not in state.scout_slots:
+            state.scout_slots[wid] = state.next_scout_slot
+            state.next_scout_slot += 1
+        target = state.explore_targets.get(wid)
+        drop = should_drop(wid, wdict, target)
+        if drop:
+            if target is not None:
+                state.scout_slots[wid] = (state.scout_slots[wid] + 1) % len(SCOUT_VECTORS)
+            avoid: set[tuple[int, int]] = set()
+            if target is not None:
+                avoid.add(target)
+                state.waypoint_last_seen[target] = tick
+            if target is not None and wdict["pos"] == target:
+                avoid.add(wdict["pos"])
+            target = pick_scout_target(
+                core_pos,
+                state.chunk_last_seen,
+                state.scout_claims,
+                state.scout_slots[wid],
+                tick,
+                avoid=avoid,
+                obstacles=obstacles,
+                waypoint_last_seen=state.waypoint_last_seen,
+            )
+            state.explore_targets[wid] = target
+            reset_progress(wid)
+            state.scout_best_dist[wid] = _manhattan(wdict["pos"], target)
+        else:
+            track_progress(wid, wdict, target)
+        state.scout_claims.add(target)
+        wdict["explore_target"] = target
 
 
 def assign_resources(
@@ -229,9 +350,11 @@ def decide_worker(
     优先级：受威胁撤退 > 满载回 Core > 到位采集 > 按任务移动。
     """
     pos = worker["pos"]
+    last_pos = worker.get("last_pos")
+    forbidden = {last_pos} if last_pos else set()
     # 遭遇敌人：向 Core 撤退（Worker 完全不能攻击）
     if pos in threat_cells:
-        d = step_direction(pos, core_pos, obstacles, occupied)
+        d = step_direction(pos, core_pos, obstacles, occupied, forbidden=forbidden)
         if d:
             return ("move", (d,))
         return ("wait", ())
@@ -241,7 +364,7 @@ def decide_worker(
             return ("deposit", ())
         # Core 格是占位实体，交付时必须走进去，所以寻路时不把 Core 格当 occupied
         occupied_for_return = occupied - {core_pos}
-        d = step_direction(pos, core_pos, obstacles, occupied_for_return)
+        d = step_direction(pos, core_pos, obstacles, occupied_for_return, forbidden=forbidden)
         if d:
             return ("move", (d,))
         return ("wait", ())
@@ -251,13 +374,14 @@ def decide_worker(
         # 附近没有已知资源：朝持久探索目标走，扩大视野。
         # last_pos 禁止回头，避免 2 格振荡。
         explore = worker.get("explore_target")
-        last_pos = worker.get("last_pos")
-        forbidden = {last_pos} if last_pos else set()
+        if explore is not None and pos == explore:
+            # 到点停下，下一 Tick 由 assign_explore_targets 换朝向；不要沿远离 Core 绕圈
+            return ("wait", ())
         if explore and pos != explore:
             d = step_direction(pos, explore, obstacles, occupied, forbidden=forbidden)
             if d:
                 return ("move", (d,))
-        # 目标到达或走不通：沿远离 Core 的轴再试一次
+        # 走不通：沿远离 Core 的轴再试一次
         away = (pos[0] * 2 - core_pos[0], pos[1] * 2 - core_pos[1])
         d = step_direction(pos, away, obstacles, occupied, forbidden=forbidden)
         if d:
@@ -269,7 +393,7 @@ def decide_worker(
         if visible is None or target in visible:
             return ("harvest", ())
         return ("wait", ())
-    d = step_direction(pos, target, obstacles, occupied)
+    d = step_direction(pos, target, obstacles, occupied, forbidden=forbidden)
     if d:
         return ("move", (d,))
     return ("wait", ())
