@@ -326,6 +326,92 @@ def test_no_progress_abandons_explore_target():
     assert workers[0]["explore_target"] != target
 
 
+def test_detour_oscillation_abandons_harvest_target():
+    """绕墙时越走越远、一直碰不到点，应冷却换目标。"""
+    from strategy import assign_resources, WorkerTask, RESOURCE_NO_PROGRESS_TICKS
+    tasks = {"w1": WorkerTask(state="harvest", target=(10, 0))}
+    workers = [{"id": "w1", "pos": (6, 1), "cargo": 0}]
+    cooldowns = {}
+    state_progress = {}
+    resources = [(10, 0), (0, 10)]
+    for tick in range(1, RESOURCE_NO_PROGRESS_TICKS + 3):
+        # 绕墙越绕越远：x 逐渐后退，到不了 (10,0)
+        workers[0]["pos"] = (6 - (tick // 2), 1 if tick % 2 else 2)
+        a = assign_resources(
+            workers, resources, {(7, 0), (8, 0), (9, 0)}, tasks,
+            tick=tick, cooldowns=cooldowns, progress=state_progress,
+        )
+    assert cooldowns.get(("w1", (10, 0)), 0) > tick, "绕墙无进展应冷却该点"
+    assert a.get("w1") != (10, 0)
+
+
+def test_hungarian_avoids_worker_collision():
+    """两个 Worker、两个点：每人一个，不能都挤最近的那颗。"""
+    from strategy import assign_resources
+    tasks = {}
+    workers = [
+        {"id": "w1", "pos": (0, 0), "cargo": 0},
+        {"id": "w2", "pos": (1, 0), "cargo": 0},
+    ]
+    resources = [(2, 0), (20, 0)]
+    a = assign_resources(workers, resources, set(), tasks)
+    assert set(a.values()) == {(2, 0), (20, 0)}
+
+
+def test_stale_memory_resource_is_deprioritized():
+    """刚看见的点应优先于很久没确认的迷雾记忆点。"""
+    from strategy import assign_resources
+    tasks = {}
+    workers = [{"id": "w1", "pos": (0, 0), "cargo": 0}]
+    resources = [(3, 0), (1, 0)]
+    last_seen = {(3, 0): 100, (1, 0): 1}
+    a = assign_resources(workers, resources, set(), tasks, tick=100, last_seen=last_seen)
+    assert a["w1"] == (3, 0)
+
+
+def test_line_of_sight_keeps_resource_behind_wall():
+    """墙后的记忆点不能因为菱形视野 overlapping 就被清掉。"""
+    from memory import MapMemory
+    from strategy import visible_from
+    from pathlib import Path
+    import tempfile
+    tmp = Path(tempfile.mkdtemp()) / "m.json"
+    mem = MapMemory(tmp)
+    mem.resource_seen[(5, 0)] = 10
+    mem.obstacles.add((2, 0))
+    vis = visible_from((0, 0), 5, mem.obstacles)
+    assert (5, 0) not in vis
+    mem.observe(11, [(2, 0)], [], (0, 0), visible_cells=vis)
+    assert (5, 0) in mem.resource_seen
+
+
+def test_harvested_cell_is_tombstoned_not_reassigned():
+    """采过的旧格不能再当目标；应去复查区块而不是死磕原坐标。"""
+    from strategy import assign_resources, StrategyState, chunk_of
+    state = StrategyState()
+    here = (4, 0)
+    state.harvested_until[here] = 50
+    tasks = {}
+    workers = [{"id": "w1", "pos": (0, 0), "cargo": 0}]
+    a = assign_resources(workers, [here], set(), tasks, tick=10, harvested_until=state.harvested_until)
+    assert "w1" not in a
+
+
+def test_due_chunk_recheck_beats_far_ring():
+    """到了 4 Tick 补充边界，应先复查刚采过的区块，而不是跑去更远的环。"""
+    from strategy import assign_explore_targets, StrategyState, chunk_of
+    core = (0, 0)
+    state = StrategyState()
+    harvested = (5, 0)
+    ch = chunk_of(harvested)
+    state.chunk_next_refill[ch] = 4
+    state.chunk_anchor[ch] = harvested
+    workers = [{"id": "w1", "pos": (0, 0), "cargo": 0}]
+    assign_explore_targets(workers, {}, core, state, tick=4)
+    target = workers[0]["explore_target"]
+    assert chunk_of(target) == ch, f"应复查刚采过的区块, got {target}"
+
+
 def test_assign_skips_cooled_resource():
     from strategy import assign_resources
     tasks = {}

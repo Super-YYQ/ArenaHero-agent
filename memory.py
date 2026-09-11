@@ -100,8 +100,8 @@ class MapMemory:
                     self._dirty = True
 
     # ---------- 查询 ----------
-    def known_resources(self, tick: int, max_age: int = 200) -> list[tuple[int, int]]:
-        """返回最近见过的资源点，按离 Core 距离由近到远。"""
+    def known_resources(self, tick: int, max_age: int = 64) -> list[tuple[int, int]]:
+        """返回最近见过的资源点，按离 Core 距离由近到远。迷雾里保留有界记忆。"""
         if not self.core_position:
             return list(self.resource_seen)
         cx, cy = self.core_position

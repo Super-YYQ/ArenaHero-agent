@@ -17,12 +17,16 @@ from memory import MapMemory
 from strategy import (
     DELTA,
     RESOURCE_COOLDOWN_TICKS,
+    RESOURCE_MEMORY_TTL,
+    VISION,
     StrategyState,
     assign_explore_targets,
     assign_resources,
     chunk_of,
     decide_vanguard,
     decide_worker,
+    refill_tick_at_or_after,
+    visible_from,
 )
 
 HERE = Path(__file__).parent
@@ -83,22 +87,17 @@ class Agent:
         # ---- 更新地图记忆 ----
         core = turn.core
         core_pos = (core.position[0], core.position[1]) if core else self.mem.core_position
-        # 当前视野覆盖的格子：己方对象视野并集（曼哈顿半径，障碍遮挡简化忽略）
+        # 当前视野：己方对象曼哈顿半径并集，障碍挡住后面（障碍格本身可见）
+        obstacles_now = {tuple(c) for c in turn.obstacle_cells} | set(self.mem.obstacles)
         visible_cells = set()
-        vision = {"CORE": 5, "WORKER": 3, "VANGUARD": 4, "RANGER": 5}
         if core:
-            cx, cy = core.position[0], core.position[1]
-            for dx in range(-5, 6):
-                for dy in range(-5, 6):
-                    if abs(dx) + abs(dy) <= 5:
-                        visible_cells.add((cx + dx, cy + dy))
-        for u in list(turn.workers) + list(turn.vanguards) + list(turn.rangers):
-            r = 3 if u in turn.workers else (4 if u in turn.vanguards else 5)
-            ux, uy = u.position[0], u.position[1]
-            for dx in range(-r, r + 1):
-                for dy in range(-r, r + 1):
-                    if abs(dx) + abs(dy) <= r:
-                        visible_cells.add((ux + dx, uy + dy))
+            visible_cells |= visible_from(core_pos, VISION["CORE"], obstacles_now)
+        for u in turn.workers:
+            visible_cells |= visible_from((u.position[0], u.position[1]), VISION["WORKER"], obstacles_now)
+        for u in turn.vanguards:
+            visible_cells |= visible_from((u.position[0], u.position[1]), VISION["VANGUARD"], obstacles_now)
+        for u in turn.rangers:
+            visible_cells |= visible_from((u.position[0], u.position[1]), VISION["RANGER"], obstacles_now)
         self.mem.observe(
             tick,
             turn.obstacle_cells,
@@ -111,16 +110,26 @@ class Agent:
         for cell in visible_cells:
             self.strat.chunk_last_seen[chunk_of(cell)] = tick
 
-        # HARVEST_FAILED：该 (worker, 失败格) 进入冷却，避免反复去采空点
+        # HARVEST_FAILED / 采空：该点冷却，并给所在区块排补充复查
         for ev in turn.events:
             et = getattr(ev, "event_type", None)
-            if et in ("HARVEST_FAILED", "RESOURCE_DEPLETED") or (isinstance(et, str) and "HARVEST_FAILED" in et):
+            et_s = et if isinstance(et, str) else getattr(et, "value", str(et or ""))
+            if et in ("HARVEST_FAILED", "RESOURCE_DEPLETED", "HARVEST_SUCCEEDED") or (
+                isinstance(et_s, str) and ("HARVEST" in et_s or "RESOURCE_DEPLETED" in et_s)
+            ):
                 actor = str(getattr(ev, "actor_id", "") or "")
                 pos = getattr(ev, "position", None)
-                if actor and pos is not None:
+                if pos is not None:
                     cell = (int(pos[0]), int(pos[1]))
-                    self.strat.resource_cooldowns[(actor, cell)] = tick + RESOURCE_COOLDOWN_TICKS
-                    # 清掉卡住的任务
+                    ready = refill_tick_at_or_after(tick + 1)
+                    self.strat.harvested_until[cell] = ready
+                    ch = chunk_of(cell)
+                    self.strat.chunk_next_refill[ch] = ready
+                    self.strat.chunk_anchor[ch] = cell
+                    if actor:
+                        self.strat.resource_cooldowns[(actor, cell)] = tick + RESOURCE_COOLDOWN_TICKS
+                        self.strat.worker_tasks.pop(actor, None)
+                elif actor:
                     self.strat.worker_tasks.pop(actor, None)
 
         # ---- 汇总视野 ----
@@ -164,13 +173,21 @@ class Agent:
 
         # ---- 资源分配 ----
         resource_cells = [tuple(c) for c in turn.resource_cells]
-        # 补上记忆中较新的资源点（视野外），排除障碍格（旧记忆可能过期冲突）
-        for cell in self.mem.known_resources(tick):
+        for cell in resource_cells:
+            ch = chunk_of(cell)
+            self.strat.chunk_anchor[ch] = cell
+            self.strat.harvested_until.pop(cell, None)
+        # 迷雾里仍有效的记忆点（过期/墓碑除外），排除障碍
+        for cell in self.mem.known_resources(tick, max_age=RESOURCE_MEMORY_TTL):
             if cell not in resource_cells and cell not in obstacles:
-                resource_cells.append(cell)
+                if self.strat.harvested_until.get(cell, 0) <= tick:
+                    resource_cells.append(cell)
         assignment = assign_resources(
             workers, resource_cells, obstacles, self.strat.worker_tasks,
             tick=tick, cooldowns=self.strat.resource_cooldowns,
+            last_seen=self.mem.resource_seen,
+            harvested_until=self.strat.harvested_until,
+            progress=self.strat.harvest_progress,
         )
 
         # 没有资源任务的 Worker：环形侦察，目标选最久没扫过的区块。

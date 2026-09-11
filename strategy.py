@@ -103,6 +103,20 @@ class StrategyState:
     no_progress_count: dict[str, int] = field(default_factory=dict)
     # 侦察航点 -> 最后一次到达/放弃的 tick；按点记，避免 32×32 把近处西侧误判成已扫
     waypoint_last_seen: dict[tuple[int, int], int] = field(default_factory=dict)
+    # 采过的旧格 -> 墓碑解除 tick（补充边界之后才允许再当目标）
+    harvested_until: dict[tuple[int, int], int] = field(default_factory=dict)
+    # 区块 -> 下次补充复查 tick
+    chunk_next_refill: dict[tuple[int, int], int] = field(default_factory=dict)
+    # 区块 -> 上次确认有资源/采到的锚点
+    chunk_anchor: dict[tuple[int, int], tuple[int, int]] = field(default_factory=dict)
+    # 区块 -> 上次派人复查的 tick
+    chunk_last_probe: dict[tuple[int, int], int] = field(default_factory=dict)
+    # worker_id -> 当前采点上见过的最短曼哈顿距离
+    harvest_best_dist: dict[str, int] = field(default_factory=dict)
+    # worker_id -> 采点距离没有缩短的连续 tick
+    harvest_no_progress: dict[str, int] = field(default_factory=dict)
+    # worker_id -> (target, best_dist, stalled)；绕墙无进展时冷却该点
+    harvest_progress: dict[str, tuple[tuple[int, int], int, int]] = field(default_factory=dict)
 
 
 # 16 方向 × 4 环，半径 10/20/30/40。社区成熟方案（Drew-Z arena-hero-agent）。
@@ -117,7 +131,11 @@ SCOUT_RING_COUNT = 4
 SCOUT_STALL_TICKS = 3
 SCOUT_NO_PROGRESS_TICKS = 6
 RESOURCE_COOLDOWN_TICKS = 8
+RESOURCE_NO_PROGRESS_TICKS = 6
+RESOURCE_MEMORY_TTL = 64
+REFILL_TICKS = 4
 CHUNK_SIZE = 32
+VISION = {"CORE": 5, "WORKER": 3, "VANGUARD": 4, "RANGER": 5}
 
 
 def chunk_of(cell: tuple[int, int]) -> tuple[int, int]:
@@ -125,6 +143,28 @@ def chunk_of(cell: tuple[int, int]) -> tuple[int, int]:
     x, y = cell
     return (x // CHUNK_SIZE if x >= 0 else -((-x - 1) // CHUNK_SIZE) - 1,
             y // CHUNK_SIZE if y >= 0 else -((-y - 1) // CHUNK_SIZE) - 1)
+
+
+def chunk_center(chunk: tuple[int, int]) -> tuple[int, int]:
+    cx, cy = chunk
+    return (cx * CHUNK_SIZE + CHUNK_SIZE // 2, cy * CHUNK_SIZE + CHUNK_SIZE // 2)
+
+
+def _chunk_recheck_points(chunk: tuple[int, int], anchor: tuple[int, int] | None):
+    """补充复查：锚点 → 区块中心 → 四角。"""
+    seen: set[tuple[int, int]] = set()
+    cx, cy = chunk
+    center = chunk_center(chunk)
+    corners = (
+        (cx * CHUNK_SIZE, cy * CHUNK_SIZE),
+        (cx * CHUNK_SIZE + CHUNK_SIZE - 1, cy * CHUNK_SIZE),
+        (cx * CHUNK_SIZE, cy * CHUNK_SIZE + CHUNK_SIZE - 1),
+        (cx * CHUNK_SIZE + CHUNK_SIZE - 1, cy * CHUNK_SIZE + CHUNK_SIZE - 1),
+    )
+    for cand in ((anchor,) if anchor else ()) + (center,) + corners:
+        if cand not in seen:
+            seen.add(cand)
+            yield cand
 
 
 def should_abandon_scout(stall: int, stall_limit: int = SCOUT_STALL_TICKS) -> bool:
@@ -200,6 +240,121 @@ def _manhattan(a: tuple[int, int], b: tuple[int, int]) -> int:
     return abs(a[0] - b[0]) + abs(a[1] - b[1])
 
 
+def refill_tick_at_or_after(tick: int) -> int:
+    """下一个 4 Tick 资源补充边界（含当前 tick）。"""
+    rem = tick % REFILL_TICKS
+    return tick if rem == 0 else tick + (REFILL_TICKS - rem)
+
+
+def _los_clear(frm: tuple[int, int], to: tuple[int, int], obstacles: set[tuple[int, int]]) -> bool:
+    """整数 supercover：中间格有障碍则看不见终点（障碍格本身可见）。"""
+    x0, y0 = frm
+    x1, y1 = to
+    dx = abs(x1 - x0)
+    dy = abs(y1 - y0)
+    sx = 1 if x1 >= x0 else -1
+    sy = 1 if y1 >= y0 else -1
+    x, y = x0, y0
+    if dx == 0 and dy == 0:
+        return True
+    if dx >= dy:
+        err = dx
+        for _ in range(dx):
+            x += sx
+            err += 2 * dy
+            if err >= 2 * dx:
+                y += sy
+                err -= 2 * dx
+            if (x, y) == (x1, y1):
+                return True
+            if (x, y) in obstacles:
+                return False
+    else:
+        err = dy
+        for _ in range(dy):
+            y += sy
+            err += 2 * dx
+            if err >= 2 * dy:
+                x += sx
+                err -= 2 * dy
+            if (x, y) == (x1, y1):
+                return True
+            if (x, y) in obstacles:
+                return False
+    return True
+
+
+def visible_from(origin: tuple[int, int], radius: int, obstacles: set[tuple[int, int]]) -> set[tuple[int, int]]:
+    """曼哈顿半径内、不被障碍挡住的格子（障碍格本身可见）。"""
+    ox, oy = origin
+    seen: set[tuple[int, int]] = set()
+    for dx in range(-radius, radius + 1):
+        for dy in range(-radius, radius + 1):
+            if abs(dx) + abs(dy) > radius:
+                continue
+            cell = (ox + dx, oy + dy)
+            if _los_clear(origin, cell, obstacles):
+                seen.add(cell)
+    return seen
+
+
+def _minimum_cost_assignment(costs: list[list[int]]) -> tuple[int, ...]:
+    """矩形匈牙利（行 <= 列），返回每行选中的列。"""
+    if not costs:
+        return ()
+    rows = len(costs)
+    columns = len(costs[0])
+    row_potential = [0] * (rows + 1)
+    column_potential = [0] * (columns + 1)
+    matched_row = [0] * (columns + 1)
+    previous = [0] * (columns + 1)
+    for row_index in range(1, rows + 1):
+        matched_row[0] = row_index
+        current_column = 0
+        minimum_slack = [10**12] * (columns + 1)
+        visited = [False] * (columns + 1)
+        while True:
+            visited[current_column] = True
+            current_row = matched_row[current_column]
+            delta = 10**12
+            next_column = 0
+            for column_index in range(1, columns + 1):
+                if visited[column_index]:
+                    continue
+                reduced = (
+                    costs[current_row - 1][column_index - 1]
+                    - row_potential[current_row]
+                    - column_potential[column_index]
+                )
+                if reduced < minimum_slack[column_index]:
+                    minimum_slack[column_index] = reduced
+                    previous[column_index] = current_column
+                if minimum_slack[column_index] < delta:
+                    delta = minimum_slack[column_index]
+                    next_column = column_index
+            for column_index in range(columns + 1):
+                if visited[column_index]:
+                    row_potential[matched_row[column_index]] += delta
+                    column_potential[column_index] -= delta
+                else:
+                    minimum_slack[column_index] -= delta
+            current_column = next_column
+            if matched_row[current_column] == 0:
+                break
+        while True:
+            next_column = previous[current_column]
+            matched_row[current_column] = matched_row[next_column]
+            current_column = next_column
+            if current_column == 0:
+                break
+    assignment = [-1] * rows
+    for column_index in range(1, columns + 1):
+        row_index = matched_row[column_index]
+        if row_index:
+            assignment[row_index - 1] = column_index - 1
+    return tuple(assignment)
+
+
 def assign_explore_targets(
     workers: list[dict],
     assignment: dict[str, tuple[int, int]],
@@ -208,7 +363,7 @@ def assign_explore_targets(
     tick: int,
     obstacles: set[tuple[int, int]] | None = None,
 ) -> None:
-    """给没有资源任务的空载 Worker 分配环形侦察目标。原地改 workers 与 state。"""
+    """给没有资源任务的空载 Worker 分配侦察目标。原地改 workers 与 state。"""
     obstacles = obstacles or set()
 
     def reset_progress(wid: str) -> None:
@@ -227,8 +382,7 @@ def assign_explore_targets(
         best = state.scout_best_dist.get(wid)
         if best is None:
             return False
-        stuck = dist >= best and state.no_progress_count.get(wid, 0) + 1 >= SCOUT_NO_PROGRESS_TICKS
-        return stuck
+        return dist >= best and state.no_progress_count.get(wid, 0) + 1 >= SCOUT_NO_PROGRESS_TICKS
 
     def track_progress(wid: str, wdict: dict, target: tuple[int, int]) -> None:
         dist = _manhattan(wdict["pos"], target)
@@ -238,6 +392,34 @@ def assign_explore_targets(
             state.no_progress_count[wid] = 0
         else:
             state.no_progress_count[wid] = state.no_progress_count.get(wid, 0) + 1
+
+    def pick_new(wid: str, avoid: set[tuple[int, int]]) -> tuple[int, int]:
+        blocked = obstacles | avoid | state.scout_claims
+        due = []
+        for ch, ready in state.chunk_next_refill.items():
+            if ready > tick:
+                continue
+            last = state.chunk_last_probe.get(ch, -1)
+            if last >= ready and tick - last < REFILL_TICKS:
+                continue
+            due.append(ch)
+        due.sort(key=lambda ch: _manhattan(core_pos, state.chunk_anchor.get(ch, chunk_center(ch))))
+        for ch in due:
+            for cand in _chunk_recheck_points(ch, state.chunk_anchor.get(ch)):
+                if cand in blocked:
+                    continue
+                state.chunk_last_probe[ch] = tick
+                return cand
+        return pick_scout_target(
+            core_pos,
+            state.chunk_last_seen,
+            state.scout_claims,
+            state.scout_slots[wid],
+            tick,
+            avoid=avoid,
+            obstacles=obstacles,
+            waypoint_last_seen=state.waypoint_last_seen,
+        )
 
     state.scout_claims.clear()
     for wdict in workers:
@@ -260,8 +442,7 @@ def assign_explore_targets(
             state.scout_slots[wid] = state.next_scout_slot
             state.next_scout_slot += 1
         target = state.explore_targets.get(wid)
-        drop = should_drop(wid, wdict, target)
-        if drop:
+        if should_drop(wid, wdict, target):
             if target is not None:
                 state.scout_slots[wid] = (state.scout_slots[wid] + 1) % len(SCOUT_VECTORS)
             avoid: set[tuple[int, int]] = set()
@@ -270,16 +451,7 @@ def assign_explore_targets(
                 state.waypoint_last_seen[target] = tick
             if target is not None and wdict["pos"] == target:
                 avoid.add(wdict["pos"])
-            target = pick_scout_target(
-                core_pos,
-                state.chunk_last_seen,
-                state.scout_claims,
-                state.scout_slots[wid],
-                tick,
-                avoid=avoid,
-                obstacles=obstacles,
-                waypoint_last_seen=state.waypoint_last_seen,
-            )
+            target = pick_new(wid, avoid)
             state.explore_targets[wid] = target
             reset_progress(wid)
             state.scout_best_dist[wid] = _manhattan(wdict["pos"], target)
@@ -296,44 +468,85 @@ def assign_resources(
     tasks: dict[str, WorkerTask],
     tick: int = 0,
     cooldowns: dict[tuple[str, tuple[int, int]], int] | None = None,
+    last_seen: dict[tuple[int, int], int] | None = None,
+    harvested_until: dict[tuple[int, int], int] | None = None,
+    progress: dict[str, tuple[tuple[int, int], int, int]] | None = None,
 ) -> dict[str, tuple[int, int]]:
-    """把资源点分配给空载 Worker：每格最多一个 Worker，最近的优先。
+    """空载 Worker 认领资源：匈牙利最小费用，每格最多一人。
 
-    cooldowns: (worker_id, cell) -> 冷却解除 tick。未到解除 tick 的点不分配给该 Worker。
+    last_seen: 格子最后确认 tick，越旧惩罚越大。
+    harvested_until: 墓碑，解除 tick 之前不当目标。
+    progress: worker_id -> (target, best_dist, no_progress)；绕圈无进展则冷却。
     """
-    cooldowns = cooldowns or {}
+    cooldowns = cooldowns if cooldowns is not None else {}
+    last_seen = last_seen if last_seen is not None else {}
+    harvested_until = harvested_until if harvested_until is not None else {}
+    progress = progress if progress is not None else {}
     free_workers = [w for w in workers if w["cargo"] == 0]
-    claimed: set[tuple[int, int]] = set()
-    assignment: dict[str, tuple[int, int]] = {}
+    resources = [
+        cell for cell in resource_cells
+        if cell not in obstacles and harvested_until.get(cell, 0) <= tick
+    ]
 
     def cooled(wid: str, cell: tuple[int, int]) -> bool:
         return cooldowns.get((wid, cell), 0) > tick
 
-    # 第一遍：已有有效 harvest 任务的 Worker 保住自己的目标（就近持续开采）
+    # 绕墙无进展：距离长期不缩短则冷却该点
     for w in free_workers:
         t = tasks.get(w["id"])
-        if t and t.state == "harvest" and t.target in resource_cells and not cooled(w["id"], t.target):
-            claimed.add(t.target)
-            assignment[w["id"]] = t.target
-        elif t and t.state == "harvest":
-            tasks.pop(w["id"], None)
+        if not (t and t.state == "harvest" and t.target is not None):
+            progress.pop(w["id"], None)
+            continue
+        dist = _manhattan(w["pos"], t.target)
+        prev = progress.get(w["id"])
+        if prev is None or prev[0] != t.target:
+            progress[w["id"]] = (t.target, dist, 0)
+            continue
+        _, best, stalled = prev
+        if dist < best:
+            progress[w["id"]] = (t.target, dist, 0)
+        else:
+            stalled += 1
+            progress[w["id"]] = (t.target, best, stalled)
+            if stalled >= RESOURCE_NO_PROGRESS_TICKS:
+                cooldowns[(w["id"], t.target)] = tick + RESOURCE_COOLDOWN_TICKS
+                tasks.pop(w["id"], None)
+                progress.pop(w["id"], None)
 
-    # 第二遍：没有有效任务的 Worker 认领最近的未占用、未冷却资源点
+    if not free_workers or not resources:
+        for w in free_workers:
+            tasks.pop(w["id"], None)
+        return {}
+
+    unassigned = 10_000 * (len(free_workers) + 1)
+    forbidden = unassigned * 2
+    matrix: list[list[int]] = []
     for w in free_workers:
-        if w["id"] in assignment:
-            continue
-        best, best_cost = None, None
-        for cell in resource_cells:
-            if cell in claimed or cooled(w["id"], cell):
+        row: list[int] = []
+        sticky = tasks.get(w["id"])
+        sticky_cell = sticky.target if sticky and sticky.state == "harvest" else None
+        for cell in resources:
+            if cooled(w["id"], cell):
+                row.append(forbidden)
                 continue
-            cost = abs(w["pos"][0] - cell[0]) + abs(w["pos"][1] - cell[1])
-            if best_cost is None or cost < best_cost:
-                best, best_cost = cell, cost
-        if best is None:
+            dist = _manhattan(w["pos"], cell)
+            age = max(0, tick - last_seen[cell]) if cell in last_seen else 0
+            stale = 0 if age == 0 else min(6, 2 + age // 8)
+            stick = 2 if sticky_cell == cell else 0
+            row.append(max(0, dist + stale - stick))
+        row.extend([unassigned] * len(free_workers))
+        matrix.append(row)
+
+    assignment: dict[str, tuple[int, int]] = {}
+    chosen = _minimum_cost_assignment(matrix)
+    for i, w in enumerate(free_workers):
+        col = chosen[i]
+        if col < 0 or col >= len(resources) or matrix[i][col] >= forbidden:
+            tasks.pop(w["id"], None)
             continue
-        claimed.add(best)
-        assignment[w["id"]] = best
-        tasks[w["id"]] = WorkerTask(state="harvest", target=best)
+        cell = resources[col]
+        assignment[w["id"]] = cell
+        tasks[w["id"]] = WorkerTask(state="harvest", target=cell)
     return assignment
 
 
