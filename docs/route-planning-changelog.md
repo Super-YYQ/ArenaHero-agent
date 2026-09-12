@@ -80,11 +80,25 @@
 
 ## Phase 7:性能、观测和稳定性收尾
 
-- `benchmark_pathfinding.py`:8 张固定地图 × 基线贪心 vs 混合规划器,输出到达率、无进展 Tick、规划失败误判、展开节点等指标。
-- Worker 决策循环逐 Worker 异常隔离:单 Worker 规划异常时该 Worker wait,其余 Worker 与 `turn.submit()` 不受影响。
-- 统计字段补齐并对日志做容量约束;验证损坏 `memory.json` 与旧格式的降级行为(测试覆盖)。
-- 基准结果见下节。
+- `benchmark_pathfinding.py`:9 张固定地图 × 基线贪心 vs 混合规划器,输出到达率、无进展 Tick、规划失败误判、单步决策耗时、多 Worker 单 Tick 吞吐、缓存命中行为。
+- Worker/Vanguard 决策循环逐单元异常隔离:单 Worker 规划异常时该 Worker wait,其余 Worker 与 `turn.submit()` 不受影响。
+- `HybridPathPlanner.prune_workers()`:每 Tick 清理失效 Worker ID 的路线/失败/受阻记录;失败目标与缓存均有容量上限。
+- `ChunkNavigationIndex.prune_components()`:冷区(512 Tick 未更新)丢弃详细连通分量、保留边界摘要,内容再次变化时惰性重建。
+- 重连降级:静态地图与导航摘要从 `memory.json` 恢复,路线游标全部丢弃重新规划(测试覆盖);损坏 `memory.json` 导航字段只丢摘要。
+- 日志不含 API Key;真实 API 环境的联网验证按计划要求不作为测试依赖执行。
 
-## 基准结果(离线固定地图,2026-09-12)
+## 基准结果(离线固定地图,2026-09-12,Windows/Python 3.12)
 
-见 `benchmark_pathfinding.py` 输出;数值随提交记录在提交说明中。
+复现命令:`python benchmark_pathfinding.py`(确定性,无网络)。
+
+| 指标 | 基线贪心 | 混合规划器 | 要求 |
+|---|---|---|---|
+| 可达地图到达率 | 7/8(88%) | **8/8(100%)** | ≥90% ✓ |
+| 可达地图平均无进展 Tick | 53.0 | **4.8** | 相对降低 ≥50%(实际 -91%)✓ |
+| 预算不足误判为不可达 | — | **0** | =0 ✓ |
+| 简单直线单步决策 | 1.8 µs | 7.8 µs(快速层) | <1 ms/Worker ✓ |
+| 10 Worker 单 Tick 最坏耗时 | — | 近距 3.0 ms / 跨区块 6.8 ms | 稳定完成 ✓ |
+| 同一路线二走 A* 展开 | — | 0 次(缓存命中) | 不重复展开 ✓ |
+
+关键用例 `greedy_trap`(散乱墙构成振荡环):基线贪心 400 Tick 内无法到达(386 个无进展 Tick),规划器 21 Tick 到达(BFS 最短 20)。
+耗时数字为开发机参考值,用于量级比较;服务端命令窗口内余量充足。

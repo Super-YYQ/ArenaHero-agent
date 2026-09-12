@@ -275,32 +275,21 @@ class Agent:
             workers, assignment, core_pos, self.strat, tick, obstacles=obstacles,
         )
 
-        # ---- Worker 行动 ----
-        for w, wdict in zip(turn.workers, workers):
-            action, args = decide_worker(
-                wdict, core_pos, assignment, obstacles, occupied, threat_cells,
-                planner=self.planner,
-            )
-            log.info(
-                "tick %s: worker %s @%s cargo=%s -> %s %s (target=%s explore=%s)",
-                tick, wdict["id"][:8], wdict["pos"], wdict["cargo"],
-                action, args, assignment.get(wdict["id"]),
-                wdict.get("explore_target"),
-            )
-            self._apply_worker(w, action, args, occupied)
-            self._handle_route_result(wdict, assignment, tick)
-            # 决策前位置记入 last_pos（给下一 Tick 禁止回头）。
-            # stall：本 Tick 发出的动作不是 move，视为停在原地。
-            if action != "move":
-                self.strat.stall_count[wdict["id"]] = self.strat.stall_count.get(wdict["id"], 0) + 1
-            else:
-                self.strat.stall_count[wdict["id"]] = 0
-            self.strat.last_pos[wdict["id"]] = wdict["pos"]
+        # ---- Worker 行动（单 Worker 异常隔离，绝不阻塞整 Tick 提交）----
+        self._run_workers(turn, workers, core_pos, assignment, obstacles, occupied,
+                          threat_cells, tick)
 
         # ---- Vanguard 行动 ----
         for v, vdict in zip(turn.vanguards, vanguards):
-            action, args = decide_vanguard(vdict, core_pos, enemies, obstacles, occupied)
-            self._apply_vanguard(v, action, args, occupied)
+            try:
+                action, args = decide_vanguard(vdict, core_pos, enemies, obstacles, occupied)
+                self._apply_vanguard(v, action, args, occupied)
+            except Exception:
+                log.exception("vanguard %s 行动异常，本 Tick 等待", vdict["id"][:8])
+                try:
+                    v.wait()
+                except Exception:
+                    log.exception("vanguard %s 等待失败", vdict["id"][:8])
 
         # ---- Core 行动：优先补 Worker，够数后补 Vanguard ----
         self._decide_core(turn, core, len(workers), len(vanguards))
@@ -310,6 +299,43 @@ class Agent:
         self._maybe_log_route_stats(tick)
 
     # ---------- 指令翻译 ----------
+    def _run_workers(self, turn, workers, core_pos, assignment, obstacles, occupied,
+                     threat_cells, tick) -> None:
+        """逐 Worker 决策与执行；单个 Worker 的异常只影响自己（wait），不阻塞提交。"""
+        for w, wdict in zip(turn.workers, workers):
+            try:
+                action, args = decide_worker(
+                    wdict, core_pos, assignment, obstacles, occupied, threat_cells,
+                    planner=self.planner,
+                )
+                log.info(
+                    "tick %s: worker %s @%s cargo=%s -> %s %s (target=%s explore=%s)",
+                    tick, wdict["id"][:8], wdict["pos"], wdict["cargo"],
+                    action, args, assignment.get(wdict["id"]),
+                    wdict.get("explore_target"),
+                )
+            except Exception:
+                log.exception("worker %s 决策异常，本 Tick 等待", wdict["id"][:8])
+                action, args = "wait", ()
+            self._apply_worker(w, action, args, occupied)
+            try:
+                self._handle_route_result(wdict, assignment, tick)
+            except Exception:
+                log.exception("worker %s 路线结果处理异常", wdict["id"][:8])
+            # 决策前位置记入 last_pos（给下一 Tick 禁止回头）。
+            # stall：本 Tick 发出的动作不是 move，视为停在原地。
+            if action != "move":
+                self.strat.stall_count[wdict["id"]] = self.strat.stall_count.get(wdict["id"], 0) + 1
+            else:
+                self.strat.stall_count[wdict["id"]] = 0
+            self.strat.last_pos[wdict["id"]] = wdict["pos"]
+        # 清理失效 Worker 的规划内存态（死亡/重连后 ID 变化）
+        if self.planner is not None:
+            self.planner.prune_workers({wd["id"] for wd in workers})
+        # 冷热区：长期未更新区块丢弃详细连通分量
+        if self.mem.chunk_index is not None:
+            self.mem.chunk_index.prune_components(tick)
+
     def _handle_route_result(self, wdict: dict, assignment: dict, tick: int) -> None:
         """规划器确认目标不可达时，沿用现有冷却/任务清理与航点放弃规则。"""
         if self.planner is None:

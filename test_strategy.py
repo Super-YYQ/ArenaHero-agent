@@ -1155,6 +1155,119 @@ def test_two_scouts_do_not_crosslock_via_cache():
     assert d1 not in occupied and d2 not in occupied
 
 
+# ---------- Phase 7：性能、观测和稳定性 ----------
+
+def test_planner_prune_workers_cleans_stale_ids():
+    """失效 Worker ID 的路线/失败记录/占用计数全部清理。"""
+    from pathfinding import HybridPathPlanner
+    p = HybridPathPlanner()
+    p.begin_tick(0)
+    p.next_step("alive", (0, 0), (40, 5), obstacles=set(), occupied={(0, 0)})
+    p.next_step("dead", (0, 0), (40, 5), obstacles=set(), occupied={(0, 0)})
+    p._failed_goals["dead"] = {(5, 5)}
+    p._fast_blocks["dead"] = ((5, 5), 3)
+    p.prune_workers({"alive"})
+    assert "dead" not in p.routes
+    assert "dead" not in p._failed_goals
+    assert "dead" not in p._fast_blocks
+    assert "dead" not in p.last_results
+    assert "alive" in p.routes
+
+
+def test_chunk_index_prune_components():
+    """冷区丢弃详细连通分量，内容再次变化时惰性重建。"""
+    from pathfinding import ChunkNavigationIndex
+    idx = ChunkNavigationIndex()
+    idx.observe([(0, 0), (1, 0), (2, 0)], set(), now_tick=10)
+    s = idx.summary((0, 0))
+    assert s.connected_components
+    assert idx.prune_components(1000, cold_after_ticks=512) == 1
+    assert s.connected_components == ()
+    assert s.boundary_openings  # 冷区仍保留边界摘要
+    # 再次活跃（内容变化）→ 重建
+    idx.observe([(3, 0)], set(), now_tick=1001)
+    assert s.connected_components
+    assert idx.prune_components(1002, cold_after_ticks=512) == 0
+
+
+class _FakeUnit:
+    def __init__(self, uid, pos):
+        self.id = uid
+        self.position = pos
+        self.cargo = 0
+        self.calls = []
+
+    def move(self, d):
+        self.calls.append(("move", str(d)))
+
+    def wait(self):
+        self.calls.append(("wait", None))
+
+    def harvest(self):
+        self.calls.append(("harvest", None))
+
+    def deposit(self):
+        self.calls.append(("deposit", None))
+
+
+def test_worker_exception_does_not_block_others():
+    """单 Worker 决策异常：该 Worker wait，其余 Worker 正常决策。"""
+    import tempfile
+    import types
+
+    import agent as agent_mod
+    from agent import Agent
+    from memory import MapMemory
+    tmp = Path(tempfile.mkdtemp()) / "m.json"
+    ag = Agent({"enable_path_planner": True}, mem=MapMemory(tmp))
+    real = agent_mod.decide_worker
+
+    def flaky(wdict, *a, **kw):
+        if wdict["id"] == "w1":
+            raise RuntimeError("boom")
+        return real(wdict, *a, **kw)
+
+    agent_mod.decide_worker = flaky
+    try:
+        w1, w2 = _FakeUnit("u1", (0, 0)), _FakeUnit("u2", (0, 1))
+        wd1 = {"id": "w1", "pos": (0, 0), "cargo": 0}
+        wd2 = {"id": "w2", "pos": (0, 1), "cargo": 0}
+        ag._run_workers(types.SimpleNamespace(workers=[w1, w2]),
+                        [wd1, wd2], (0, 0), {"w2": (2, 1)}, set(),
+                        {(0, 0), (0, 1)}, set(), 1)
+    finally:
+        agent_mod.decide_worker = real
+    assert w1.calls == [("wait", None)], "异常 Worker 应回退 wait"
+    assert w2.calls and w2.calls[0][0] == "move", "其余 Worker 不受影响"
+    assert ag.strat.last_pos["w1"] == (0, 0)
+
+
+def test_reconnect_restores_memory_and_drops_routes():
+    """断线重连：静态地图与导航摘要恢复，路线游标丢弃后可重新规划。"""
+    import tempfile
+
+    from agent import Agent
+    from memory import MapMemory
+    tmp = Path(tempfile.mkdtemp()) / "m.json"
+    ag1 = Agent({"enable_path_planner": True}, mem=MapMemory(tmp))
+    ag1.planner.begin_tick(1)
+    ag1.planner.next_step("w1", (0, 0), (40, 5), obstacles=set(), occupied={(0, 0)})
+    ag1.mem.observe(1, [(2, 0)], [], (0, 0), visible_cells={(0, 0), (1, 0), (2, 0)})
+    ag1.mem.save()
+    assert ag1.planner.routes
+    # 重连：全新 Agent/规划器，加载同一 memory.json
+    ag2 = Agent({"enable_path_planner": True}, mem=MapMemory(tmp))
+    assert ag2.planner.routes == {}
+    assert ag2.mem.obstacles == {(2, 0)}
+    assert ag2.mem.chunk_index.is_known((1, 0))
+    ag2.planner.begin_tick(1, is_known=ag2.mem.chunk_index.is_known)
+    r = ag2.planner.next_step("w1", (0, 0), (40, 5),
+                              obstacles=ag2.mem.obstacles, occupied={(0, 0)})
+    # 重连后已知地图稀疏：未知惩罚下允许先返回前沿，但必须可推进
+    assert r.status in ("FOUND", "FRONTIER")
+    assert r.steps
+
+
 def load_tests(loader, tests, pattern):
     """让 `python -m unittest discover` 也能执行本文件的普通函数测试。"""
     import unittest

@@ -62,6 +62,20 @@ def cross_chunk_map() -> tuple[set, tuple, tuple]:
     return obstacles, (0, 0), (40, 5)
 
 
+def greedy_trap_map() -> tuple[set, tuple, tuple]:
+    """贪心陷阱：散乱墙组成 3 格振荡环，贪心+禁止回头 400 Tick 内到不了。
+
+    规划器 A* 可在约最优长度到达（见 benchmark_pathfinding.py）。
+    """
+    obstacles = {
+        (-1, 3), (-1, 5), (-1, 6), (-1, 10), (0, 4), (0, 5), (1, 0), (1, 1),
+        (2, 6), (3, 8), (4, 3), (4, 5), (5, 1), (5, 4), (5, 7), (5, 8),
+        (6, 5), (6, 7), (7, -1), (7, 2), (7, 7), (7, 9), (8, 5), (8, 7),
+        (8, 9), (9, 2), (9, 5), (9, 6), (9, 8), (10, 6),
+    }
+    return obstacles, (0, 0), (9, 9)
+
+
 FIXTURES = {
     "empty": empty_map,
     "straight_wall": straight_wall_map,
@@ -71,6 +85,7 @@ FIXTURES = {
     "enclosed": enclosed_map,
     "negative_quadrant": negative_quadrant_map,
     "cross_chunk": cross_chunk_map,
+    "greedy_trap": greedy_trap_map,
 }
 
 

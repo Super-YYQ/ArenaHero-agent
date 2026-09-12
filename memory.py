@@ -122,7 +122,7 @@ class MapMemory:
                 cells |= {tuple(c) for c in visible_cells}
             else:
                 cells |= set(self.obstacles)
-            if self.chunk_index.observe(cells, self.obstacles) > 0:
+            if self.chunk_index.observe(cells, self.obstacles, now_tick=tick) > 0:
                 self._dirty = True
         for cell in resource_cells:
             cell = tuple(cell)

@@ -451,6 +451,7 @@ class ChunkNavigationSummary:
     boundary_openings: dict = field(default_factory=dict)
     connected_components: tuple = ()
     revision: int = 0
+    last_active_tick: int = 0
 
     def passable(self, cell: tuple[int, int]) -> bool:
         """已知且非障碍。未知格不算可通行（调用方按"需要探索"处理）。"""
@@ -530,7 +531,7 @@ class ChunkNavigationIndex:
         return pairs
 
     # ---------- 更新 ----------
-    def observe(self, cells, obstacles) -> int:
+    def observe(self, cells, obstacles, now_tick: int = 0) -> int:
         """合并新观察（cells 含障碍格）。返回内容实际变化的区块数。"""
         changed: dict[tuple[int, int], ChunkNavigationSummary] = {}
         for cell in cells:
@@ -546,9 +547,25 @@ class ChunkNavigationIndex:
                 s.known_cells.add(cell)
                 s.known_obstacles.add(cell)
                 changed[s.chunk] = s
+        touched = set(changed)
+        for chunk in touched:
+            self.chunks[chunk].last_active_tick = now_tick
         for s in changed.values():
             self._recompute(s)
         return len(changed)
+
+    def prune_components(self, now_tick: int, cold_after_ticks: int = 512) -> int:
+        """冷热区策略：长期未更新的冷区丢弃详细连通分量，保留边界摘要。
+
+        冷区再次有内容变化时 _recompute 会惰性重建分量。返回裁剪的区块数。
+        """
+        pruned = 0
+        for s in self.chunks.values():
+            if (s.connected_components
+                    and now_tick - s.last_active_tick > cold_after_ticks):
+                s.connected_components = ()
+                pruned += 1
+        return pruned
 
     def _summary_for(self, cell: tuple[int, int]) -> ChunkNavigationSummary:
         chunk = chunk_of(cell)
@@ -1083,3 +1100,19 @@ class HybridPathPlanner:
             while goals and total > limit:
                 goals.pop()
                 total -= 1
+
+    def prune_workers(self, active_ids) -> None:
+        """清理失效 Worker（死亡/重连后 ID 变化）的全部内存态。"""
+        active = set(active_ids)
+        for wid in list(self.routes):
+            if wid not in active:
+                del self.routes[wid]
+        for wid in list(self._failed_goals):
+            if wid not in active:
+                del self._failed_goals[wid]
+        for wid in list(self._fast_blocks):
+            if wid not in active:
+                del self._fast_blocks[wid]
+        for wid in list(self.last_results):
+            if wid not in active:
+                del self.last_results[wid]
