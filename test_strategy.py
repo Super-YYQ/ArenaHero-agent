@@ -1591,6 +1591,84 @@ def test_hoard_waits_for_min_population():
     assert len(core.spawned) == 2, "达标(95)后恢复生产"
 
 
+# ---------- Core 格进入串行化(修复交付死锁) ----------
+
+def test_core_entry_serialized():
+    """同一 Tick 只允许一个 Worker 申报进入 Core 格,其余排队。"""
+    from pathfinding import DELTA, HybridPathPlanner
+    core = (-1397, 1657)
+    p = HybridPathPlanner()
+    p.begin_tick(0)
+    workers = [
+        {"id": "w1", "pos": (-1396, 1657), "cargo": 1},
+        {"id": "w2", "pos": (-1398, 1657), "cargo": 1},
+        {"id": "w3", "pos": (-1397, 1658), "cargo": 1},
+    ]
+    occupied = {core} | {w["pos"] for w in workers}
+    core_reserved = False
+    entries = 0
+    for w in workers:
+        action, args = decide_worker(w, core, {}, set(), set(occupied), set(),
+                                     planner=p, core_cell_reserved=core_reserved)
+        if action == "move":
+            dx, dy = DELTA[args[0]]
+            dest = (w["pos"][0] + dx, w["pos"][1] + dy)
+            if dest == core:
+                entries += 1
+                core_reserved = True
+    assert entries <= 1, f"同一 Tick {entries} 个 Worker 申报进 Core,服务端会整批拒绝"
+
+
+def test_legacy_core_entry_serialized():
+    """旧贪心路径同样遵守 Core 格串行申报。"""
+    from pathfinding import DELTA
+    core = (0, 0)
+    w = {"id": "w1", "pos": (1, 0), "cargo": 1}
+    action, args = decide_worker(w, core, {}, set(), {core, (1, 0)}, set(),
+                                 core_cell_reserved=True)
+    if action == "move":
+        dx, dy = DELTA[args[0]]
+        assert (1 + dx, 0 + dy) != core, "已有人申报进 Core,本 Worker 不得再进"
+
+
+def test_core_entry_queue_drains():
+    """满载 Worker 围 Core:每人隔 Tick 进入交付,队列最终清空。"""
+    from pathfinding import DELTA, HybridPathPlanner
+    core = (-1397, 1657)
+    p = HybridPathPlanner()
+    ws = {
+        "w1": {"id": "w1", "pos": (-1396, 1657), "cargo": 1, "last_pos": None,
+               "explore_target": None},
+        "w2": {"id": "w2", "pos": (-1398, 1657), "cargo": 1, "last_pos": None,
+               "explore_target": None},
+        "w3": {"id": "w3", "pos": (-1397, 1658), "cargo": 1, "last_pos": None,
+               "explore_target": None},
+    }
+    deposits = 0
+    for tick in range(1, 60):
+        p.begin_tick(0)
+        occupied = {core} | {w["pos"] for w in ws.values()}
+        core_reserved = False
+        for wid, w in ws.items():
+            if w["cargo"] == 0 and w["pos"] == core and w["explore_target"] is None:
+                w["explore_target"] = (-1500, 1750)  # 交付完立刻派走
+            action, args = decide_worker(w, core, {}, set(), set(occupied), set(),
+                                         planner=p, core_cell_reserved=core_reserved)
+            if action == "deposit":
+                w["cargo"] = 0
+                deposits += 1
+            elif action == "move":
+                dx, dy = DELTA[args[0]]
+                dest = (w["pos"][0] + dx, w["pos"][1] + dy)
+                if dest == core:
+                    core_reserved = True
+                w["last_pos"] = w["pos"]
+                w["pos"] = dest
+                if w["pos"] != core:
+                    w["explore_target"] = w.get("explore_target")
+    assert deposits == 3, f"队列应在 60 Tick 内清空,实际交付 {deposits}"
+
+
 def load_tests(loader, tests, pattern):
     """让 `python -m unittest discover` 也能执行本文件的普通函数测试。"""
     import unittest

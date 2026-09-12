@@ -336,11 +336,13 @@ class Agent:
     def _run_workers(self, turn, workers, core_pos, assignment, obstacles, occupied,
                      threat_cells, enemy_zones, tick) -> None:
         """逐 Worker 决策与执行；单个 Worker 的异常只影响自己（wait），不阻塞提交。"""
+        core_reserved = False  # 本 Tick 是否已有 Worker 申报进入 Core 格
         for w, wdict in zip(turn.workers, workers):
             try:
                 action, args = decide_worker(
                     wdict, core_pos, assignment, obstacles, occupied, threat_cells,
                     planner=self.planner, threat_zones=enemy_zones,
+                    core_cell_reserved=core_reserved,
                 )
                 log.info(
                     "tick %s: worker %s @%s cargo=%s -> %s %s (target=%s explore=%s)",
@@ -351,6 +353,10 @@ class Agent:
             except Exception:
                 log.exception("worker %s 决策异常，本 Tick 等待", wdict["id"][:8])
                 action, args = "wait", ()
+            if action == "move" and args:
+                dx, dy = DELTA[args[0]]
+                if (wdict["pos"][0] + dx, wdict["pos"][1] + dy) == core_pos:
+                    core_reserved = True  # 之后本 Tick 的人不能再申报进 Core
             self._apply_worker(w, action, args, occupied)
             try:
                 self._handle_route_result(wdict, assignment, tick)

@@ -692,6 +692,7 @@ def decide_worker(
     threat_cells: set[tuple[int, int]],
     planner=None,
     threat_zones: set[tuple[int, int]] | None = None,
+    core_cell_reserved: bool = False,
 ) -> tuple[str, tuple]:
     """返回 (action, args)，action ∈ {'harvest','deposit','move','wait'}。
 
@@ -700,6 +701,8 @@ def decide_worker(
     planner 为 None 时保持旧的单步贪心行为（回归兼容，含侦察 away 兜底）。
     threat_cells 是能打到自己的格子（撤退触发）；threat_zones 是更大的路线
     惩罚圈（如敌方基地周边），传给规划器的 threat_penalty 绕开硬穿。
+    core_cell_reserved：本 Tick 已有其他 Worker 申报进入 Core 格——Core 每格
+    只能容 1 个 Unit，多个人同时申报进格会被服务端依赖图整批拒绝，必须串行。
     """
     pos = worker["pos"]
     last_pos = worker.get("last_pos")
@@ -723,9 +726,11 @@ def decide_worker(
         if worker["cargo"] > 0:
             if pos == core_pos:
                 return ("deposit", ())
-            # Core 格是占位实体，交付时必须走进去：allow_goal_occupied=True
+            # Core 格是占位实体，交付时必须走进去：allow_goal_occupied=True；
+            # 但本 Tick 已有人申报进 Core 时按占用处理，在旁排队
             r = planner.next_step(wid, pos, core_pos, obstacles=obstacles, occupied=occupied,
-                                  forbidden=forbidden, allow_goal_occupied=True,
+                                  forbidden=forbidden,
+                                  allow_goal_occupied=not core_cell_reserved,
                                   threat=threat, goal_kind="core")
             return move_or_wait(r)
         target = assignment.get(wid)
@@ -758,8 +763,9 @@ def decide_worker(
     if worker["cargo"] > 0:
         if pos == core_pos:
             return ("deposit", ())
-        # Core 格是占位实体，交付时必须走进去，所以寻路时不把 Core 格当 occupied
-        occupied_for_return = occupied - {core_pos}
+        # Core 格是占位实体，交付时必须走进去，所以寻路时不把 Core 格当 occupied；
+        # 本 Tick 已有人申报进 Core 时保持占用，在旁排队（见 core_cell_reserved）
+        occupied_for_return = occupied - (set() if core_cell_reserved else {core_pos})
         d = step_direction(pos, core_pos, obstacles, occupied_for_return, forbidden=forbidden)
         if d:
             return ("move", (d,))
