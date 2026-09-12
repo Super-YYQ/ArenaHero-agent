@@ -1309,23 +1309,22 @@ def test_sweep_assigns_distinct_chunks():
 
 
 def test_sweep_cursor_advances_and_cycles():
-    """停留点逐点推进；一个区块扫完后标记完成并轮转到下一区块。"""
+    """停留点逐点推进；一个区块扫完后标记完成并轮转到别的区块。"""
     from strategy import StrategyState, assign_explore_targets, chunk_of, chunk_sweep_points
     state = StrategyState()
     workers = [{"id": "w1", "pos": (0, 0), "cargo": 0}]
-    targets = []
-    for tick in range(1, 40):
-        prev = state.explore_targets.get("w1")
-        if prev is not None:
-            workers[0]["pos"] = prev  # 到达上一停留点
+    assign_explore_targets(workers, {}, (0, 0), state, 1)
+    chunk = state.sweep_assign["w1"]
+    targets = [workers[0]["explore_target"]]
+    for tick in range(2, 40):
+        workers[0]["pos"] = workers[0]["explore_target"]  # 到达上一停留点
         assign_explore_targets(workers, {}, (0, 0), state, tick)
         targets.append(workers[0]["explore_target"])
-    expected = chunk_sweep_points((0, 0))
-    assert targets[:25] == expected, "第一轮应按扫描线顺序推进"
-    assert state.chunk_last_swept.get((0, 0)) is not None
-    assert state.sweep_cursor[(0, 0)] == 0, "扫完游标归零等待下一轮"
-    # 之后轮转到邻近区块
-    assert chunk_of(targets[25]) != (0, 0)
+    assert targets[:25] == chunk_sweep_points(chunk), "第一轮应按扫描线顺序推进"
+    assert state.chunk_last_swept.get(chunk) is not None
+    assert state.sweep_cursor[chunk] == 0, "扫完游标归零等待下一轮"
+    # 之后轮转到别的区块
+    assert chunk_of(targets[25]) != chunk
 
 
 def test_sweep_due_refill_chunk_gets_priority():
@@ -1561,6 +1560,18 @@ def test_normal_spawn_without_hoard_unchanged():
     core2 = _FakeCore()
     ag2._decide_core(_fake_turn(10), core2, n_workers=10, n_vanguards=0)
     assert core2.spawned == [UnitType.VANGUARD], "Worker 满编后按旧逻辑补 Vanguard"
+
+
+def test_sweep_prefers_chunks_near_worker():
+    """远处 Worker 重新认领时选离自己近的未扫区块,不被派去地图对角。"""
+    from strategy import StrategyState, assign_explore_targets, chunk_of
+    state = StrategyState()
+    # Worker 在东北角远处;核心块与其余块均未扫
+    workers = [{"id": "w1", "pos": (-1320, 1575), "cargo": 0}]
+    assign_explore_targets(workers, {}, (-1397, 1657), state, 200)
+    ch = state.sweep_assign["w1"]
+    assert ch == (-42, 49), f"应就近认领东北角块, got {ch}"
+    assert chunk_of(workers[0]["explore_target"]) == (-42, 49)
 
 
 def load_tests(loader, tests, pattern):

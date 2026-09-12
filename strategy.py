@@ -119,6 +119,7 @@ SWEEP_CHUNK_RADIUS = 2            # Core 周边 5×5 个区块纳入扫掠
 SWEEP_LINE_OFFSETS = (3, 10, 17, 24, 31)   # 行距 7：视野 ±3 无缝覆盖 32 行
 SWEEP_POINT_X_OFFSETS = (2, 8, 14, 20, 29)  # 首点 ≤3、末点 ≥28，行走沿线全覆盖
 SWEEP_MIN_CHUNK_GAP = 2           # 活跃区块最小切比雪夫距离：防止多 Worker 挤在同一片
+SWEEP_STARVE_TICKS = 1500         # 区块超过该 Tick 未扫则插队，防止远处区块饿死
 ENEMY_CORE_ZONE_RADIUS = 4        # 敌方基地的路线规避圈（驻军防御范围）
 
 
@@ -447,19 +448,28 @@ def assign_explore_targets(
             due.append(ch)
         return due
 
-    def sweep_next(wid: str, due_set: set) -> tuple[int, int] | None:
+    def sweep_next(wid: str, due_set: set, worker_pos: tuple[int, int]) -> tuple[int, int] | None:
         """取下一个扫掠停留点。
 
         优先延续当前区块（最省路程）；到期复查区块（补点在等）次之，且不受
         间隔约束；新认领区块与所有活跃区块保持切比雪夫距离 ≥
-        SWEEP_MIN_CHUNK_GAP，避免多 Worker 挤在同一片区域重复覆盖。
+        SWEEP_MIN_CHUNK_GAP。候选按"离 Worker 自己的距离"排序——刚扫完远角
+        就近拿下一块，而不是被派去地图对角；超期未扫的区块插队防饿死，
+        Worker 距离打平时用 Core 距离兜底（多 Worker 同起点的退化场景）。
         """
         core_chunk = chunk_of(core_pos)
         r = SWEEP_CHUNK_RADIUS
         cands = [(core_chunk[0] + dx, core_chunk[1] + dy)
                  for dx in range(-r, r + 1) for dy in range(-r, r + 1)]
+
+        def starving(ch: tuple[int, int]) -> bool:
+            swept = state.chunk_last_swept.get(ch, -1)
+            return swept != -1 and tick - swept > SWEEP_STARVE_TICKS
+
         cands.sort(key=lambda ch: (
-            state.chunk_last_swept.get(ch, -1),
+            0 if starving(ch) else 1,
+            abs(ch[0] * CHUNK_SIZE + 16 - worker_pos[0])
+            + abs(ch[1] * CHUNK_SIZE + 16 - worker_pos[1]),
             abs(ch[0] - core_chunk[0]) + abs(ch[1] - core_chunk[1]), ch))
 
         def advance(ch: tuple[int, int]) -> tuple[int, int] | None:
@@ -513,9 +523,9 @@ def assign_explore_targets(
                     return point
         return None
 
-    def pick_new(wid: str, avoid: set[tuple[int, int]]) -> tuple[int, int]:
+    def pick_new(wid: str, avoid: set[tuple[int, int]], worker_pos: tuple[int, int]) -> tuple[int, int]:
         if sweep:
-            point = sweep_next(wid, set(due_refill_chunks()))
+            point = sweep_next(wid, set(due_refill_chunks()), worker_pos)
             if point is not None:
                 return point
         else:
@@ -574,7 +584,7 @@ def assign_explore_targets(
                 avoid.add(target)
             if target is not None and wdict["pos"] == target:
                 avoid.add(wdict["pos"])
-            target = pick_new(wid, avoid)
+            target = pick_new(wid, avoid, wdict["pos"])
             state.explore_targets[wid] = target
             reset_progress(wid)
             state.scout_best_dist[wid] = _manhattan(wdict["pos"], target)
