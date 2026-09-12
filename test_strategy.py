@@ -848,6 +848,78 @@ def test_cache_hit_then_cursor_walks_to_goal():
     assert arrived and pos == goal
 
 
+# ---------- Phase 4：BFS 前沿与渐进降级 ----------
+
+_POCKET_WALL = {(1, y) for y in range(-15, 16)}
+
+
+def test_planner_astar_budget_falls_back_to_bfs_frontier():
+    """A* 预算内无进展（死路口袋）→ BFS approach 前沿推进，最终到达。"""
+    from map_fixtures import get_fixture
+    from pathfinding import DELTA, FRONTIER, HybridPathPlanner
+    obstacles, start, goal = get_fixture("straight_wall")  # 直墙 8 格，先用它验证快速层外路径
+    p = HybridPathPlanner(astar_max_expansions=50, frontier_max_expansions=4000,
+                          fast_path_distance=0)
+    p.begin_tick(0)
+    r = p.next_step("w", (0, 0), (10, 0), obstacles=_POCKET_WALL, occupied={(0, 0)})
+    assert r.status == FRONTIER
+    assert r.reason == "approach_frontier"
+    assert p.stats.bfs_calls == 1
+    # 沿前沿逐 Tick 推进最终到达
+    pos, arrived = (0, 0), False
+    for _ in range(300):
+        r = p.next_step("w", pos, (10, 0), obstacles=_POCKET_WALL, occupied={pos})
+        if r.status == "AT_TARGET":
+            arrived = True
+            break
+        assert r.steps, f"前沿推进中无动作: {r.status}/{r.reason}"
+        dx, dy = DELTA[r.steps[0]]
+        pos = (pos[0] + dx, pos[1] + dy)
+    assert arrived and pos == (10, 0)
+
+
+def test_scout_blocked_gets_explore_frontier_not_failed():
+    """侦察目标被封死：返回探索前沿继续推进，不记录失败目标。"""
+    from map_fixtures import get_fixture
+    from pathfinding import BLOCKED, FRONTIER, HybridPathPlanner
+    obstacles, start, goal = get_fixture("enclosed")
+    # 已知区域：墙盒及以西全部已知，盒以东是迷雾
+    known = {c for c in ((x, y) for x in range(-5, 13) for y in range(-5, 6))}
+    p = HybridPathPlanner(fast_path_distance=0)
+    p.begin_tick(1, is_known=lambda c: c in known)
+    r = p.next_step("w", start, goal, obstacles=obstacles, occupied={start},
+                    goal_kind="scout")
+    assert r.status == FRONTIER, f"侦察应有探索前沿, got {r.status}/{r.reason}"
+    assert goal not in p._failed_goals.get("w", set())
+    # 同一目标作为资源目标：确认 BLOCKED 并记录失败（交给冷却）
+    p2 = HybridPathPlanner(fast_path_distance=0)
+    p2.begin_tick(1, is_known=lambda c: c in known)
+    r2 = p2.next_step("w", start, goal, obstacles=obstacles, occupied={start},
+                      goal_kind="harvest")
+    assert r2.status == BLOCKED
+    assert goal in p2._failed_goals["w"]
+
+
+def test_budget_exhausted_does_not_cooldown_resource():
+    """预算不足绝不触发资源冷却；只有确认 BLOCKED 才进入失败处理。"""
+    import tempfile
+
+    from agent import Agent
+    from map_fixtures import get_fixture
+    from memory import MapMemory
+    from pathfinding import BUDGET_EXHAUSTED
+    obstacles, start, goal = get_fixture("cross_chunk")
+    tmp = Path(tempfile.mkdtemp()) / "m.json"
+    agent = Agent({"enable_path_planner": True, "total_path_budget": 1,
+                   "fast_path_distance": 0}, mem=MapMemory(tmp))
+    agent.planner.begin_tick(0)
+    r = agent.planner.next_step("w1", start, goal, obstacles=obstacles, occupied={start})
+    assert r.status == BUDGET_EXHAUSTED
+    wdict = {"id": "w1", "pos": start, "cargo": 0}
+    agent._handle_route_result(wdict, {"w1": goal}, tick=10)
+    assert ("w1", goal) not in agent.strat.resource_cooldowns, "预算不足不得冷却资源"
+
+
 def load_tests(loader, tests, pattern):
     """让 `python -m unittest discover` 也能执行本文件的普通函数测试。"""
     import unittest

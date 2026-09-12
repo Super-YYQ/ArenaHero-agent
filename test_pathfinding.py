@@ -15,6 +15,7 @@ from pathfinding import (
     FRONTIER,
     PathRequest,
     astar_search,
+    bfs_frontier,
     manhattan,
     step_direction,
     steps_to_cells,
@@ -223,6 +224,49 @@ def test_step_direction_reexport():
     assert strategy.step_direction is step_direction
     assert strategy.DELTA is DELTA
     assert step_direction((0, 0), (3, 0), set(), set()) == "RIGHT"
+
+
+# ---------- Phase 4：BFS 前沿 ----------
+
+def test_bfs_frontier_approach_finds_closer_cell():
+    """A* 卡死场景（死路口袋）：BFS approach 找到更接近目标的前沿并可回溯。"""
+    wall = {(1, y) for y in range(-15, 16)}
+    start, goal = (0, 0), (10, 0)
+    r = bfs_frontier(_request(wall, start, goal), mode="approach", max_expansions=2000)
+    assert r.status == FRONTIER
+    assert r.reason == "approach_frontier"
+    _assert_steps_legal(r, start, goal)
+    assert manhattan(r.endpoint, goal) < manhattan(start, goal), "前沿应更接近目标"
+
+
+def test_bfs_frontier_truncation_never_blocked():
+    """BFS 预算截断返回 BUDGET_EXHAUSTED，绝不误报 BLOCKED。"""
+    wall = {(1, y) for y in range(-15, 16)}
+    r = bfs_frontier(_request(wall, (0, 0), (10, 0)), mode="approach", max_expansions=5)
+    assert r.status == BUDGET_EXHAUSTED
+    assert r.status != BLOCKED
+
+
+def test_bfs_frontier_explore_uses_known_domain():
+    """explore 模式：只扩展已知格，前沿为未知边界；截断安全。"""
+    wall = {(1, y) for y in range(-15, 16)}
+    known = {c for c in ((x, y) for x in range(-5, 0) for y in range(-5, 6))}
+    known |= {(0, y) for y in range(-5, 6)}
+    r = bfs_frontier(_request(wall, (0, 0), (10, 0), is_known=lambda c: c in known),
+                     mode="explore", max_expansions=500)
+    assert r.status == FRONTIER
+    _assert_steps_legal(r, (0, 0), (10, 0))
+    # 终点必须紧邻未知格
+    from pathfinding import DELTA
+    assert any((r.endpoint[0] + dx, r.endpoint[1] + dy) not in known
+               for dx, dy in DELTA.values())
+
+
+def test_bfs_frontier_deterministic():
+    wall = {(1, y) for y in range(-15, 16)}
+    r1 = bfs_frontier(_request(wall, (0, 0), (10, 0)), mode="approach", max_expansions=2000)
+    r2 = bfs_frontier(_request(wall, (0, 0), (10, 0)), mode="approach", max_expansions=2000)
+    assert r1 == r2
 
 
 def load_tests(loader, tests, pattern):

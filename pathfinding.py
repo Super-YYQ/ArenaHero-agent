@@ -337,6 +337,92 @@ class RouteCache:
         return len(self._data)
 
 
+def bfs_frontier(
+    request: PathRequest,
+    *,
+    mode: str = "approach",
+    unknown_boundary_penalty: int = 0,
+    max_expansions: int | None = None,
+) -> PathResult:
+    """带完整前驱链的 BFS 前沿搜索（渐进降级层）。
+
+    只负责两类任务：
+    - mode="approach"：A* 预算耗尽时，找当前可达且更靠近目标的前沿；
+    - mode="explore"：目标被已知障碍阻断时，找能推进探索的未知边界前沿。
+
+    评分 frontier_score = 4*Manhattan(cell, goal) + 1*distance_from_start
+                        + unknown_boundary_penalty(未知邻接) + threat_penalty，
+    越小越好，tie-break (score, y, x) 确定性一致。
+    有界性由展开上限保证；截断或无前沿时返回 BUDGET_EXHAUSTED，
+    绝不把"没搜完"报告成 BLOCKED。
+    """
+    start, goal = request.start, request.goal
+    h0 = manhattan(start, goal)
+    if mode == "approach" and h0 == 0:
+        return PathResult(AT_TARGET, (), start, 0, 0, request.map_version)
+    max_exp = request.max_expansions if max_expansions is None else max(1, max_expansions)
+    is_known = request.is_known
+    known_domain = is_known is not None
+    threat_penalty = request.threat_penalty
+
+    def frontier_score(cell: tuple[int, int], dist_from_start: int, adjacent_unknown: bool) -> int:
+        score = 4 * manhattan(cell, goal) + dist_from_start
+        if adjacent_unknown:
+            score += unknown_boundary_penalty
+        if threat_penalty and cell in request.threat:
+            score += threat_penalty
+        return score
+
+    def is_candidate(cell: tuple[int, int], adjacent_unknown: bool) -> bool:
+        if mode == "approach":
+            return manhattan(cell, goal) < h0
+        return adjacent_unknown
+
+    def adjacent_to_unknown(cell: tuple[int, int]) -> bool:
+        if not known_domain:
+            return False
+        for _, nxt in neighbors(cell):
+            if nxt not in request.obstacles and not is_known(nxt):
+                return True
+        return False
+
+    dist = {start: 0}
+    came_from: dict[tuple[int, int], tuple[int, int]] = {}
+    queue = deque([start])
+    expansions = 0
+    truncated = False
+    best = None  # (score, y, x, cell)
+
+    while queue:
+        cell = queue.popleft()
+        expansions += 1
+        if expansions > max_exp:
+            truncated = True
+            break
+        for _, nxt in neighbors(cell):
+            if nxt in dist:
+                continue
+            if nxt in request.obstacles or nxt in request.occupied or nxt in request.forbidden:
+                continue
+            if known_domain and not is_known(nxt):
+                continue  # 未知格不入队，只作前沿参照
+            dist[nxt] = dist[cell] + 1
+            came_from[nxt] = cell
+            adj_unknown = adjacent_to_unknown(nxt)
+            if nxt != start and is_candidate(nxt, adj_unknown):
+                score = frontier_score(nxt, dist[nxt], adj_unknown)
+                if best is None or (score, nxt[1], nxt[0]) < (best[0], best[1], best[2]):
+                    best = (score, nxt[1], nxt[0], nxt)
+            queue.append(nxt)
+
+    if best is not None:
+        steps = _reconstruct_steps(came_from, start, best[3])
+        return PathResult(FRONTIER, steps, best[3], expansions, dist[best[3]],
+                          request.map_version, reason=f"{mode}_frontier")
+    return PathResult(BUDGET_EXHAUSTED, (), None, expansions, 0, request.map_version,
+                      reason="frontier_truncated" if truncated else "no_frontier")
+
+
 # ---------- 混合规划器（快速层 + 局部 A*） ----------
 
 @dataclass
@@ -510,7 +596,7 @@ class HybridPathPlanner:
 
         # 3) 局部 A*（预算内；replan 结果不写入静态缓存）
         result = self._astar_step(worker_id, start, goal, obstacles, occupied, forbidden,
-                                  allow_goal_occupied, threat, replan=replan)
+                                  allow_goal_occupied, threat, replan=replan, goal_kind=goal_kind)
         self.last_results[worker_id] = result
         return result
 
@@ -551,7 +637,8 @@ class HybridPathPlanner:
         return manhattan(start, goal) <= self.fast_path_distance
 
     def _astar_step(self, worker_id, start, goal, obstacles, occupied, forbidden,
-                    allow_goal_occupied, threat, replan: bool = False) -> PathResult:
+                    allow_goal_occupied, threat, replan: bool = False,
+                    goal_kind: str = "harvest") -> PathResult:
         if self._budget_left <= 0:
             self.stats.budget_exhausted += 1
             self.stats.note_failure("tick_budget")
@@ -620,15 +707,53 @@ class HybridPathPlanner:
                                 result.expanded, result.cost, self.map_version,
                                 reason="astar_frontier")
         elif result.status == BLOCKED:
-            self.stats.blocked += 1
             self.stats.note_failure(result.reason)
+            if goal_kind == "scout" and result.reason != "goal_is_known_obstacle":
+                # 侦察目标被已知障碍阻断：先找能推进探索的前沿，不清除目标
+                fallback = self._frontier_fallback(worker_id, start, goal, obstacles,
+                                                   occupied, forbidden, mode="explore")
+                if fallback is not None:
+                    return fallback
+            self.stats.blocked += 1
             self._failed_goals.setdefault(worker_id, set()).add(goal)
             self._cap_failed_goals()
             self.routes.pop(worker_id, None)
         elif result.status == BUDGET_EXHAUSTED:
             self.stats.budget_exhausted += 1
             self.stats.note_failure(result.reason)
+            fallback = self._frontier_fallback(worker_id, start, goal, obstacles,
+                                               occupied, forbidden, mode="approach")
+            if fallback is not None:
+                return fallback
         return result
+
+    def _frontier_fallback(self, worker_id, start, goal, obstacles, occupied,
+                           forbidden, mode: str) -> PathResult | None:
+        """A* 受阻时的 BFS 前沿降级；成功时返回本 Tick 的一步并建立游标。"""
+        budget = min(self.frontier_max_expansions, self._budget_left)
+        if budget <= 0:
+            return None
+        request = PathRequest(
+            start=start, goal=goal, obstacles=obstacles, occupied=occupied,
+            forbidden=forbidden, max_expansions=budget,
+            threat_penalty=self.threat_penalty,
+            is_known=self.is_known, map_version=self.map_version,
+        )
+        result = bfs_frontier(request, mode=mode)
+        self.stats.bfs_calls += 1
+        self._budget_left = max(0, self._budget_left - result.expanded)
+        self.stats.expanded_nodes += result.expanded
+        if result.status == FRONTIER and result.steps:
+            self.stats.frontier_returns += 1
+            self.routes[worker_id] = WorkerRoute(
+                target=goal, steps=result.steps, next_index=1,
+                map_version=self.map_version, planned_endpoint=result.endpoint,
+                status=FRONTIER, start=start,
+            )
+            return PathResult(FRONTIER, (result.steps[0],), result.endpoint,
+                              result.expanded, result.cost, self.map_version,
+                              reason=result.reason)
+        return None
 
     def _cap_failed_goals(self, limit: int = 256) -> None:
         """失败目标记录有容量上限，防止长期运行无界增长。"""
