@@ -299,6 +299,7 @@ class Agent:
             last_seen=self.mem.resource_seen,
             harvested_until=self.strat.harvested_until,
             progress=self.strat.harvest_progress,
+            core_space=turn.resource_space,
         )
 
         # 没有资源任务的 Worker：近场逐区块扫掠（发现资源点的主要手段），

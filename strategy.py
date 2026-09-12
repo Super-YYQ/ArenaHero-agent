@@ -604,18 +604,25 @@ def assign_resources(
     last_seen: dict[tuple[int, int], int] | None = None,
     harvested_until: dict[tuple[int, int], int] | None = None,
     progress: dict[str, tuple[tuple[int, int], int, int]] | None = None,
+    core_space: int | None = None,
 ) -> dict[str, tuple[int, int]]:
     """空载 Worker 认领资源：匈牙利最小费用，每格最多一人。
 
     last_seen: 格子最后确认 tick，越旧惩罚越大。
     harvested_until: 墓碑，解除 tick 之前不当目标。
     progress: worker_id -> (target, best_dist, no_progress)；绕圈无进展则冷却。
+    core_space: Core 剩余容量。满仓(<=0)时停止派发采集——交付不进去，
+    采了也背在身上，只会把交付口堵死；Worker 全部转入扫掠待命。
     """
     cooldowns = cooldowns if cooldowns is not None else {}
     last_seen = last_seen if last_seen is not None else {}
     harvested_until = harvested_until if harvested_until is not None else {}
     progress = progress if progress is not None else {}
     free_workers = [w for w in workers if w["cargo"] == 0]
+    if core_space is not None and core_space <= 0:
+        for w in free_workers:
+            tasks.pop(w["id"], None)
+        return {}
     resources = [
         cell for cell in resource_cells
         if cell not in obstacles and harvested_until.get(cell, 0) <= tick

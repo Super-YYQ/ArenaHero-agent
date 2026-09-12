@@ -1686,6 +1686,23 @@ def test_vanguard_leaves_core_cell():
     assert action2 == "wait"
 
 
+def test_assign_resources_pauses_when_core_full():
+    """Core 满仓:停止派发采集任务(交付不进去),Worker 转入扫掠待命。"""
+    from strategy import WorkerTask, assign_resources
+    tasks = {"w1": WorkerTask(state="harvest", target=(2, 2))}
+    workers = [{"id": "w1", "pos": (2, 2), "cargo": 0}]
+    a = assign_resources(workers, [(2, 2)], set(), tasks, tick=10, core_space=0)
+    assert a == {} and "w1" not in tasks, "满仓时应清空采集任务"
+    # 有空间时恢复分配
+    tasks2 = {}
+    a2 = assign_resources(workers, [(2, 2)], set(), tasks2, tick=11, core_space=5)
+    assert a2.get("w1") == (2, 2)
+    # core_space 未提供(None)时保持旧行为
+    tasks3 = {}
+    a3 = assign_resources(workers, [(2, 2)], set(), tasks3, tick=12)
+    assert a3.get("w1") == (2, 2)
+
+
 def load_tests(loader, tests, pattern):
     """让 `python -m unittest discover` 也能执行本文件的普通函数测试。"""
     import unittest
