@@ -9,65 +9,21 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-# 四个正方向（服务端只接受这四种）
-DIRECTIONS = ("UP", "DOWN", "LEFT", "RIGHT")
-DELTA = {
-    "UP": (0, -1),
-    "DOWN": (0, 1),
-    "LEFT": (-1, 0),
-    "RIGHT": (1, 0),
-}
+from pathfinding import (
+    DELTA,
+    DIRECTIONS,
+    neighbors,
+    step_direction,
+)
 
-
-def neighbors(cell: tuple[int, int]):
-    x, y = cell
-    for d in DIRECTIONS:
-        dx, dy = DELTA[d]
-        yield d, (x + dx, y + dy)
-
-
-def step_direction(
-    frm: tuple[int, int],
-    to: tuple[int, int],
-    obstacles: set[tuple[int, int]],
-    occupied: set[tuple[int, int]],
-    forbidden: set[tuple[int, int]] | None = None,
-) -> str | None:
-    """贪心单步：朝 to 走一步，返回方向名；无法走返回 None。
-
-    每格最多 2 个占位实体、Core 占 1，因此 occupied 里的格子不能进。
-    forbidden 用于禁止回头（刚走过的格子），打断 2 格振荡。
-    """
-    if frm == to:
-        return None
-    x, y = frm
-    tx, ty = to
-    dx, dy = tx - x, ty - y
-    forbidden = forbidden or set()
-
-    # 主方向（距离更长的轴）优先，被挡时垂直绕行，最后才回头
-    main_axis = []
-    if abs(dx) >= abs(dy) and dx != 0:
-        main_axis.append("RIGHT" if dx > 0 else "LEFT")
-        main_axis.append("DOWN" if dy >= 0 else "UP")
-        main_axis.append("UP" if dy >= 0 else "DOWN")
-        main_axis.append("LEFT" if dx > 0 else "RIGHT")
-    else:
-        main_axis.append("DOWN" if dy > 0 else "UP")
-        main_axis.append("RIGHT" if dx >= 0 else "LEFT")
-        main_axis.append("LEFT" if dx >= 0 else "RIGHT")
-        main_axis.append("UP" if dy > 0 else "DOWN")
-
-    fallback = None
-    for d in main_axis:
-        nx, ny = x + DELTA[d][0], y + DELTA[d][1]
-        if (nx, ny) in obstacles or (nx, ny) in occupied:
-            continue
-        if (nx, ny) in forbidden:
-            fallback = fallback or d
-            continue
-        return d
-    return fallback
+# 方向工具与贪心单步已移至 pathfinding.py（路线规划基础层），
+# 此处 re-export 保持 `from strategy import DELTA / step_direction` 兼容。
+__all__ = [
+    "DELTA", "DIRECTIONS", "neighbors", "step_direction",
+    "WorkerTask", "StrategyState", "assign_explore_targets", "assign_resources",
+    "decide_worker", "decide_vanguard", "chunk_of", "chunk_center",
+    "pick_scout_target", "refill_tick_at_or_after", "visible_from",
+]
 
 
 # ---------- Worker 状态机 ----------
