@@ -128,7 +128,9 @@ class Agent:
                 fast_path_distance=pcfg["fast_path_distance"],
                 unknown_penalty=pcfg["unknown_cell_penalty"],
                 routes=self.strat.routes,
+                cache=self.strat.route_cache,
             )
+            self.strat.route_cache.capacity = pcfg["route_cache_size"]
 
     # ---------- 主循环 ----------
     def run(self) -> None:

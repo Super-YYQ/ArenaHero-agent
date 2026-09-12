@@ -15,7 +15,7 @@ PathResult.status 的固定语义（禁止用 None 同时表达到达/不可达/
 from __future__ import annotations
 
 import heapq
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
@@ -283,6 +283,60 @@ def _astar_once(request: PathRequest, respect_forbidden: bool) -> PathResult:
                       request.map_version, reason="no_path_in_known_map")
 
 
+# ---------- 路线缓存（静态路线与动态占用严格分离） ----------
+
+@dataclass(frozen=True)
+class RouteCacheKey:
+    """静态缓存键：只含起终点、地图版本与规划模式。
+
+    动态 occupied 绝不进键；planner_mode="replan" 的结果不缓存，
+    避免本 Tick 的动态占用污染静态路线。
+    """
+    start: tuple[int, int]
+    goal: tuple[int, int]
+    map_version: int
+    planner_mode: str
+
+
+class RouteCache:
+    """有容量上限的静态路线 LRU 缓存（OrderedDict 实现）。"""
+
+    def __init__(self, capacity: int = 256) -> None:
+        self.capacity = max(1, int(capacity))
+        self._data: "OrderedDict[RouteCacheKey, PathResult]" = OrderedDict()
+        self.hits = 0
+        self.misses = 0
+        self.invalidated = 0
+        self.evictions = 0
+
+    def get(self, key: RouteCacheKey) -> PathResult | None:
+        result = self._data.get(key)
+        if result is None:
+            self.misses += 1
+            return None
+        self._data.move_to_end(key)
+        self.hits += 1
+        return result
+
+    def put(self, key: RouteCacheKey, result: PathResult) -> None:
+        self._data[key] = result
+        self._data.move_to_end(key)
+        while len(self._data) > self.capacity:
+            self._data.popitem(last=False)
+            self.evictions += 1
+
+    def clear(self) -> int:
+        """清空并返回被作废的条目数。"""
+        n = len(self._data)
+        if n:
+            self.invalidated += n
+            self._data.clear()
+        return n
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+
 # ---------- 混合规划器（快速层 + 局部 A*） ----------
 
 @dataclass
@@ -357,6 +411,7 @@ class HybridPathPlanner:
         unknown_penalty: int = 1,
         threat_penalty: int = 0,
         routes: dict | None = None,
+        cache: RouteCache | None = None,
         stats: PlannerStats | None = None,
     ) -> None:
         self.astar_max_expansions = max(1, astar_max_expansions)
@@ -366,6 +421,7 @@ class HybridPathPlanner:
         self.unknown_penalty = unknown_penalty
         self.threat_penalty = threat_penalty
         self.routes: dict[str, WorkerRoute] = routes if routes is not None else {}
+        self.cache = cache if cache is not None else RouteCache()
         self.stats = stats if stats is not None else PlannerStats()
         self.map_version = 0
         self.is_known: Callable[[tuple[int, int]], bool] | None = None
@@ -384,7 +440,7 @@ class HybridPathPlanner:
         self.is_known = is_known
         self._budget_left = self.total_path_budget
         if version_changed:
-            self.stats.invalidated += len(self.routes)
+            self.stats.invalidated += len(self.routes) + self.cache.clear()
             self.routes.clear()
             self._failed_goals.clear()
             self._fast_blocks.clear()
@@ -425,6 +481,7 @@ class HybridPathPlanner:
         forbidden = frozenset(forbidden)
 
         # 1) 复用现有路线游标（动态占用每次重新验证，不进静态结构）
+        replan = False
         route = self.routes.get(worker_id)
         if route is not None:
             if route.target != goal or route.map_version != self.map_version:
@@ -434,9 +491,10 @@ class HybridPathPlanner:
                 if result is not None:
                     self.last_results[worker_id] = result
                     return result
+                replan = True
 
-        # 2) 快速层：近距离且无失败/受阻记录
-        if self._fast_allowed(worker_id, start, goal):
+        # 2) 快速层：近距离且无失败/受阻记录（replan 时跳过，直接重规划）
+        if not replan and self._fast_allowed(worker_id, start, goal):
             d = step_direction(start, goal, obstacles, occupied, forbidden=forbidden)
             if d is not None:
                 nx, ny = start[0] + DELTA[d][0], start[1] + DELTA[d][1]
@@ -450,9 +508,9 @@ class HybridPathPlanner:
             prev = self._fast_blocks.get(worker_id, (goal, 0))
             self._fast_blocks[worker_id] = (goal, prev[1] + 1 if prev[0] == goal else 1)
 
-        # 3) 局部 A*（预算内）
+        # 3) 局部 A*（预算内；replan 结果不写入静态缓存）
         result = self._astar_step(worker_id, start, goal, obstacles, occupied, forbidden,
-                                  allow_goal_occupied, threat)
+                                  allow_goal_occupied, threat, replan=replan)
         self.last_results[worker_id] = result
         return result
 
@@ -464,6 +522,7 @@ class HybridPathPlanner:
         if start != expected or route.next_index >= len(route.steps):
             # 游标错位（被挡停/被挤偏）或走完未达：局部重规划
             self.stats.replans += 1
+            self.stats.note_failure("cursor_misaligned")
             self.routes.pop(worker_id, None)
             return None
         d = route.steps[route.next_index]
@@ -472,6 +531,7 @@ class HybridPathPlanner:
             # 首步被动态占用阻挡：局部重规划，不改静态地图、不污染路线
             route.blocked_ticks += 1
             self.stats.replans += 1
+            self.stats.note_failure("first_step_blocked")
             self.routes.pop(worker_id, None)
             return None
         route.next_index += 1
@@ -491,12 +551,37 @@ class HybridPathPlanner:
         return manhattan(start, goal) <= self.fast_path_distance
 
     def _astar_step(self, worker_id, start, goal, obstacles, occupied, forbidden,
-                    allow_goal_occupied, threat) -> PathResult:
+                    allow_goal_occupied, threat, replan: bool = False) -> PathResult:
         if self._budget_left <= 0:
             self.stats.budget_exhausted += 1
             self.stats.note_failure("tick_budget")
             return PathResult(BUDGET_EXHAUSTED, (), None, 0, 0, self.map_version,
                               reason="tick_budget")
+
+        # 缓存只在"全新规划"时查询；replan 的结果带动态占用，绝不读写静态缓存
+        cache_key = None
+        if not replan:
+            cache_key = RouteCacheKey(start, goal, self.map_version, "astar")
+            cached = self.cache.get(cache_key)
+            if cached is not None and cached.status == FOUND and cached.steps:
+                first = cached.steps[0]
+                nx, ny = start[0] + DELTA[first][0], start[1] + DELTA[first][1]
+                if (nx, ny) not in obstacles and (nx, ny) not in occupied and (nx, ny) not in forbidden:
+                    self.stats.cache_hits += 1
+                    self.routes[worker_id] = WorkerRoute(
+                        target=goal, steps=cached.steps, next_index=1,
+                        map_version=self.map_version, planned_endpoint=cached.endpoint,
+                        status=FOUND, start=start,
+                    )
+                    return PathResult(FOUND, (first,), cached.endpoint, 0,
+                                      cached.cost, self.map_version, reason="cache_hit")
+                # 首步被当前动态状态挡住：局部重规划，不污染静态缓存
+                self.stats.replans += 1
+                self.stats.note_failure("cache_first_step_invalid")
+                cache_key = None
+            else:
+                self.stats.cache_misses += 1
+
         request = PathRequest(
             start=start, goal=goal, obstacles=obstacles, occupied=occupied,
             forbidden=forbidden, allow_goal_occupied=allow_goal_occupied,
@@ -519,6 +604,11 @@ class HybridPathPlanner:
                 map_version=self.map_version, planned_endpoint=result.endpoint,
                 status=result.status, start=start,
             )
+            if cache_key is not None:
+                self.cache.put(cache_key, result)
+            result = PathResult(FOUND, (result.steps[0],), result.endpoint,
+                                result.expanded, result.cost, self.map_version,
+                                reason="astar")
         elif result.status == FRONTIER and result.steps:
             self.stats.frontier_returns += 1
             self.routes[worker_id] = WorkerRoute(
@@ -526,6 +616,9 @@ class HybridPathPlanner:
                 map_version=self.map_version, planned_endpoint=result.endpoint,
                 status=result.status, start=start,
             )
+            result = PathResult(FRONTIER, (result.steps[0],), result.endpoint,
+                                result.expanded, result.cost, self.map_version,
+                                reason="astar_frontier")
         elif result.status == BLOCKED:
             self.stats.blocked += 1
             self.stats.note_failure(result.reason)

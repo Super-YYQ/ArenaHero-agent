@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from pathfinding import (
     DELTA,
     DIRECTIONS,
+    RouteCache,
     neighbors,
     step_direction,
 )
@@ -76,8 +77,8 @@ class StrategyState:
     # ---- 路线规划状态（与 HybridPathPlanner 共享；不持久化到 memory.json）----
     # worker_id -> 当前路线游标
     routes: dict = field(default_factory=dict)
-    # 静态路线缓存（Phase 3 起使用 RouteCacheKey）
-    route_cache: dict = field(default_factory=dict)
+    # 静态路线缓存（LRU，容量受配置限制；动态占用永不入缓存）
+    route_cache: RouteCache = field(default_factory=RouteCache)
     # 与 MapMemory.obstacle_revision 同步的地图版本
     map_version: int = 0
 

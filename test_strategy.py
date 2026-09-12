@@ -752,6 +752,102 @@ def test_memory_obstacle_revision_increments():
     assert mem.obstacle_revision > 0 and mem.resource_seen[(9, 9)] == 4
 
 
+# ---------- Phase 3：路线缓存与动态占用校验 ----------
+
+def test_route_cache_hit_avoids_reexpansion():
+    """同起点同目标（地图未变）：第二个 Worker 命中缓存，不重复展开 A*。"""
+    from map_fixtures import get_fixture
+    from pathfinding import HybridPathPlanner
+    obstacles, start, goal = get_fixture("cross_chunk")
+    p = HybridPathPlanner()
+    p.begin_tick(0)
+    r1 = p.next_step("a", start, goal, obstacles=obstacles, occupied={start})
+    assert r1.status == "FOUND" and p.stats.astar_calls == 1
+    r2 = p.next_step("b", start, goal, obstacles=obstacles, occupied={start})
+    assert r2.steps == r1.steps
+    assert r2.reason == "cache_hit"
+    assert p.stats.astar_calls == 1, "缓存命中不得重新展开 A*"
+    assert p.stats.cache_hits == 1 and p.stats.cache_misses == 1
+
+
+def test_cache_not_polluted_by_dynamic_occupancy():
+    """动态占用只触发局部重规划；静态缓存内容保持不变，可被后续命中。"""
+    from map_fixtures import get_fixture
+    from pathfinding import DELTA, HybridPathPlanner
+    obstacles, start, goal = get_fixture("cross_chunk")
+    p = HybridPathPlanner()
+    p.begin_tick(0)
+    r1 = p.next_step("a", start, goal, obstacles=obstacles, occupied={start})
+    dx, dy = DELTA[r1.steps[0]]
+    blocked_cell = (start[0] + dx, start[1] + dy)
+    # 另一 Worker 的占用挡住缓存路线首步：走局部重规划，不写缓存
+    r2 = p.next_step("b", start, goal, obstacles=obstacles,
+                     occupied={start, blocked_cell})
+    assert r2.steps[0] != r1.steps[0]
+    assert p.stats.replans >= 1
+    # 动态阻塞解除后，原静态路线仍可命中
+    r3 = p.next_step("c", start, goal, obstacles=obstacles, occupied={start})
+    assert r3.reason == "cache_hit"
+    assert r3.steps == r1.steps, "缓存被动态占用污染"
+    assert len(p.cache) == 1, "replan 结果不得写入静态缓存"
+
+
+def test_route_cache_lru_capacity():
+    """缓存有上限：超出容量淘汰最旧条目，计数正确。"""
+    from pathfinding import FOUND, PathResult, RouteCache, RouteCacheKey
+    cache = RouteCache(capacity=2)
+    ka = RouteCacheKey((0, 0), (1, 0), 0, "astar")
+    kb = RouteCacheKey((0, 0), (2, 0), 0, "astar")
+    kc = RouteCacheKey((0, 0), (3, 0), 0, "astar")
+    result = PathResult(FOUND, ("RIGHT",), (1, 0), 1, 1, 0)
+    cache.put(ka, result)
+    cache.put(kb, result)
+    assert cache.get(ka) is not None  # 刷新 ka，kb 成为最旧
+    cache.put(kc, result)
+    assert cache.get(kb) is None, "最旧条目应被淘汰"
+    assert cache.get(ka) is not None and cache.get(kc) is not None
+    assert len(cache) == 2
+    assert cache.hits == 3 and cache.misses == 1 and cache.evictions == 1
+    assert cache.clear() == 2 and cache.invalidated == 2
+
+
+def test_cache_cleared_on_version_bump():
+    """地图版本递增：静态缓存整体失效，下一步重新规划。"""
+    from map_fixtures import get_fixture
+    from pathfinding import HybridPathPlanner
+    obstacles, start, goal = get_fixture("cross_chunk")
+    p = HybridPathPlanner()
+    p.begin_tick(1)
+    p.next_step("a", start, goal, obstacles=obstacles, occupied={start})
+    assert len(p.cache) == 1
+    p.begin_tick(2)
+    assert len(p.cache) == 0
+    assert p.cache.invalidated == 1
+    r = p.next_step("a", start, goal, obstacles=obstacles, occupied={start})
+    assert r.reason != "cache_hit"
+
+
+def test_cache_hit_then_cursor_walks_to_goal():
+    """缓存命中后建立路线游标，能一路走到目标。"""
+    from map_fixtures import get_fixture
+    from pathfinding import DELTA, HybridPathPlanner
+    obstacles, start, goal = get_fixture("cross_chunk")
+    p = HybridPathPlanner()
+    p.begin_tick(0)
+    assert p.next_step("a", start, goal, obstacles=obstacles, occupied={start}).steps
+    # 另一 Worker 命中缓存后沿游标行进
+    pos, last_pos, arrived = start, None, False
+    for _ in range(200):
+        r = p.next_step("b", pos, goal, obstacles=obstacles, occupied={pos})
+        if r.status == "AT_TARGET":
+            arrived = True
+            break
+        assert r.steps
+        dx, dy = DELTA[r.steps[0]]
+        last_pos, pos = pos, (pos[0] + dx, pos[1] + dy)
+    assert arrived and pos == goal
+
+
 def load_tests(loader, tests, pattern):
     """让 `python -m unittest discover` 也能执行本文件的普通函数测试。"""
     import unittest
