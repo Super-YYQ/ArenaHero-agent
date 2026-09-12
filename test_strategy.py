@@ -922,6 +922,164 @@ def test_budget_exhausted_does_not_cooldown_resource():
     assert ("w1", goal) not in agent.strat.resource_cooldowns, "预算不足不得冷却资源"
 
 
+# ---------- Phase 5：增量区块导航摘要 ----------
+
+def test_chunk_of_reexport_negative():
+    """pathfinding.chunk_of 与 strategy.chunk_of 同一实现，负坐标语义一致。"""
+    import strategy
+    from pathfinding import chunk_of as pf_chunk_of
+    assert strategy.chunk_of is pf_chunk_of
+    assert pf_chunk_of((-1, -1)) == (-1, -1)
+    assert pf_chunk_of((-32, 5)) == (-1, 0)
+    assert pf_chunk_of((-33, -1)) == (-2, -1)
+    assert pf_chunk_of((31, 31)) == (0, 0)
+    assert pf_chunk_of((32, 0)) == (1, 0)
+
+
+def test_chunk_index_openings_and_components():
+    """边界开放格与连通分量：只在内容实际变化时重算。"""
+    from pathfinding import ChunkNavigationIndex
+    idx = ChunkNavigationIndex()
+    edge_cells = [(31, y) for y in range(0, 5)]
+    inner = [(x, 2) for x in range(28, 31)]
+    n = idx.observe(edge_cells + inner, {(31, 2)})
+    assert n == 1  # 全部落在区块 (0,0)
+    s = idx.summary((0, 0))
+    assert s.revision == 1
+    assert (31, 2) not in s.boundary_openings["RIGHT"]
+    assert set(s.boundary_openings["RIGHT"]) == {(31, 0), (31, 1), (31, 3), (31, 4)}
+    # 障碍把东边格列切成两段:内部 (28..30,2) 与 (31,0),(31,1)... 分量数 > 1
+    assert len(s.connected_components) >= 2
+    # 重复观察不重算
+    assert idx.observe(edge_cells + inner, {(31, 2)}) == 0
+    assert s.revision == 1
+    # 新障碍触发重算
+    assert idx.observe([], {(31, 0)}) == 1
+    assert s.revision == 2 and (31, 0) not in s.boundary_openings["RIGHT"]
+    # is_known:障碍格也是已知格
+    assert idx.is_known((31, 0)) and idx.is_known((28, 2))
+    assert not idx.is_known((5, 5))
+
+
+def test_chunk_index_corridor_and_portals_negative():
+    """曼哈顿走廊与门户：负坐标区块之间同样成立。"""
+    from pathfinding import ChunkNavigationIndex
+    idx = ChunkNavigationIndex()
+    assert idx.corridor((-1, -1), (1, 0)) == [(-1, -1), (0, -1), (1, -1), (1, 0)]
+    # 区块 (-1,0) 与 (0,0) 的东向门户:x=-1 与 x=0 的相邻格对
+    cells = []
+    for y in (0, 1, 2):
+        cells.append((-1, y))
+        cells.append((0, y))
+    idx.observe(cells, set())
+    pairs = idx.portal_cells((-1, 0), (0, 0))
+    assert ((-1, 0), (0, 0)) in pairs and ((-1, 2), (0, 2)) in pairs
+    # 未知邻居:无门户
+    assert idx.portal_cells((0, 0), (1, 0)) == []
+
+
+def test_chunk_index_persistence_roundtrip():
+    """to_dict/from_dict 往返:已知格与门户保持,连通分量加载后重算。"""
+    from pathfinding import ChunkNavigationIndex
+    idx = ChunkNavigationIndex()
+    idx.observe([(0, 0), (1, 0), (2, 0), (31, 0)], {(31, 0)})
+    s = idx.summary((0, 0))
+    comps_before = s.connected_components
+    data = idx.to_dict()
+    idx2 = ChunkNavigationIndex()
+    idx2.from_dict(data)
+    s2 = idx2.summary((0, 0))
+    assert s2.known_cells == s.known_cells
+    assert s2.known_obstacles == s.known_obstacles
+    assert s2.boundary_openings == s.boundary_openings
+    assert s2.revision == s.revision
+    assert s2.connected_components == comps_before
+    # 坏条目只丢该区块
+    data["bad-key"] = {"revision": 1}
+    data["0,0"]["known_cells"] = "corrupted"
+    idx3 = ChunkNavigationIndex()
+    idx3.from_dict(data)
+    assert len(idx3.chunks) == 0
+
+
+def test_planner_cross_chunk_uses_portals():
+    """跨区块目标：走廊+门户逐段规划；未启用索引时退回普通 A*。"""
+    from map_fixtures import get_fixture
+    from pathfinding import ChunkNavigationIndex, DELTA, HybridPathPlanner
+    obstacles, start, goal = get_fixture("cross_chunk")
+    idx = ChunkNavigationIndex()
+    known = []
+    for x in range(0, 46):
+        for y in range(-3, 11):
+            known.append((x, y))
+    idx.observe(known, obstacles)
+    p = HybridPathPlanner(fast_path_distance=12, chunk_index=idx)
+    p.begin_tick(0, is_known=idx.is_known)
+    r = p.next_step("w", start, goal, obstacles=obstacles, occupied={start})
+    assert r.reason == "chunk_segment", f"应走跨区块走廊, got {r.reason}"
+    # 沿游标推进最终到达
+    pos, arrived = start, False
+    for _ in range(200):
+        p.begin_tick(0, is_known=idx.is_known)
+        r = p.next_step("w", pos, goal, obstacles=obstacles, occupied={pos})
+        if r.status == "AT_TARGET":
+            arrived = True
+            break
+        assert r.steps, f"无动作: {r.status}/{r.reason}"
+        dx, dy = DELTA[r.steps[0]]
+        pos = (pos[0] + dx, pos[1] + dy)
+    assert arrived and pos == goal
+    # 未启用索引：同目标走普通 A*
+    p2 = HybridPathPlanner(fast_path_distance=12)
+    p2.begin_tick(0, is_known=idx.is_known)
+    r2 = p2.next_step("w", start, goal, obstacles=obstacles, occupied={start})
+    assert r2.reason != "chunk_segment"
+
+
+def test_memory_chunk_persistence_and_corruption():
+    """memory.json 往返：导航摘要恢复；损坏导航字段只丢摘要。"""
+    import json
+    import tempfile
+
+    from memory import MapMemory
+    tmp = Path(tempfile.mkdtemp()) / "m.json"
+    mem = MapMemory(tmp)
+    mem.observe(1, [(2, 0)], [], (0, 0), visible_cells={(0, 0), (1, 0), (2, 0), (3, 0)})
+    mem.save()
+    mem2 = MapMemory(tmp)
+    assert mem2.obstacles == {(2, 0)}
+    assert mem2.chunk_index.is_known((1, 0))
+    assert mem2.chunk_index.is_known((2, 0))
+    assert not mem2.chunk_index.is_known((9, 9))
+    assert mem2.obstacle_revision == 1
+    # 导航字段损坏：只丢摘要
+    data = json.loads(tmp.read_text(encoding="utf-8"))
+    data["chunk_navigation"] = "garbage"
+    tmp.write_text(json.dumps(data), encoding="utf-8")
+    mem3 = MapMemory(tmp)
+    assert mem3.obstacles == {(2, 0)}, "障碍记忆不得丢失"
+    assert len(mem3.chunk_index) == 0
+    # 旧 schema（无 schema_version / chunk_navigation）可加载
+    old = {"obstacles": [[5, 5]], "resources": {"6,6": 3}, "core_position": [0, 0]}
+    tmp.write_text(json.dumps(old), encoding="utf-8")
+    mem4 = MapMemory(tmp)
+    assert mem4.obstacles == {(5, 5)} and mem4.resource_seen == {(6, 6): 3}
+
+
+def test_agent_chunk_navigation_toggle():
+    """enable_chunk_navigation=false 时不给规划器区块索引。"""
+    import tempfile
+
+    from agent import Agent
+    from memory import MapMemory
+    tmp = Path(tempfile.mkdtemp()) / "m.json"
+    off = Agent({"enable_chunk_navigation": False}, mem=MapMemory(tmp))
+    assert off.planner.chunk_index is None
+    on = Agent({}, mem=MapMemory(tmp))
+    assert on.planner.chunk_index is not None
+    assert on.planner.is_known is None  # begin_tick 前未注入
+
+
 def load_tests(loader, tests, pattern):
     """让 `python -m unittest discover` 也能执行本文件的普通函数测试。"""
     import unittest

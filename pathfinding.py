@@ -28,8 +28,20 @@ DELTA = {
     "RIGHT": (1, 0),
 }
 
-# 区块边长（与规则文档一致），chunk_of 复用
+# 区块边长（与规则文档一致）
 CHUNK_SIZE = 32
+
+# 区块边界四边（side -> 相邻区块方向）
+CHUNK_SIDES = ("UP", "DOWN", "LEFT", "RIGHT")
+# side -> (dx, dy) 相邻区块坐标增量
+CHUNK_SIDE_NEIGHBOR = {"UP": (0, -1), "DOWN": (0, 1), "LEFT": (-1, 0), "RIGHT": (1, 0)}
+
+
+def chunk_of(cell: tuple[int, int]) -> tuple[int, int]:
+    """格子所属 32×32 区块（向下取整，与规则文档一致，支持负坐标）。"""
+    x, y = cell
+    return (x // CHUNK_SIZE if x >= 0 else -((-x - 1) // CHUNK_SIZE) - 1,
+            y // CHUNK_SIZE if y >= 0 else -((-y - 1) // CHUNK_SIZE) - 1)
 
 FOUND = "FOUND"
 FRONTIER = "FRONTIER"
@@ -423,6 +435,235 @@ def bfs_frontier(
                       reason="frontier_truncated" if truncated else "no_frontier")
 
 
+# ---------- 增量区块导航摘要 ----------
+
+@dataclass
+class ChunkNavigationSummary:
+    """单个区块的轻量导航摘要。
+
+    known_cells 是该区块全部已观察格（含障碍格）；known_obstacles ⊆ known_cells。
+    boundary_openings: side -> 该边上的已知可通行格（按扫描顺序）。
+    connected_components: 已知可通行格的连通分量（内容变化时才重算）。
+    """
+    chunk: tuple[int, int]
+    known_cells: set = field(default_factory=set)
+    known_obstacles: set = field(default_factory=set)
+    boundary_openings: dict = field(default_factory=dict)
+    connected_components: tuple = ()
+    revision: int = 0
+
+    def passable(self, cell: tuple[int, int]) -> bool:
+        """已知且非障碍。未知格不算可通行（调用方按"需要探索"处理）。"""
+        return cell in self.known_cells and cell not in self.known_obstacles
+
+
+class ChunkNavigationIndex:
+    """区块导航索引：只基于已观察信息，不为未知区域伪造距离场。
+
+    - observe() 合并新视野；只在区块内容实际变化时重算边界开放格与连通分量；
+    - is_known() 供 A* 的 unknown 惩罚使用（乐观可通行、到达即校正）；
+    - corridor()/portal_cells() 供跨区块走廊规划；
+    - to_dict()/from_dict() 负责 memory.json 持久化（连通分量不持久化，加载后重算）。
+    """
+
+    def __init__(self) -> None:
+        self.chunks: dict[tuple[int, int], ChunkNavigationSummary] = {}
+
+    # ---------- 查询 ----------
+    def summary(self, chunk: tuple[int, int]) -> ChunkNavigationSummary | None:
+        return self.chunks.get(chunk)
+
+    def is_known(self, cell: tuple[int, int]) -> bool:
+        s = self.chunks.get(chunk_of(cell))
+        return s is not None and cell in s.known_cells
+
+    def corridor(self, start_chunk: tuple[int, int], goal_chunk: tuple[int, int]) -> list:
+        """曼哈顿区块走廊（先 x 后 y，确定性）。未知区块只意味着"需要探索"。"""
+        cx, cy = start_chunk
+        gx, gy = goal_chunk
+        path = [(cx, cy)]
+        while cx != gx:
+            cx += 1 if gx > cx else -1
+            path.append((cx, cy))
+        while cy != gy:
+            cy += 1 if gy > cy else -1
+            path.append((cx, cy))
+        return path
+
+    def portal_cells(self, chunk: tuple[int, int], neighbor: tuple[int, int]) -> list:
+        """共享边界上的已知可通行门户对 [(exit, entry), ...]。
+
+        exit 属于 chunk，entry 属于 neighbor，两格相邻。
+        任一侧区块未知（无摘要）时返回空列表。
+        """
+        cx, cy = chunk
+        nx, ny = neighbor
+        here = self.chunks.get(chunk)
+        there = self.chunks.get(neighbor)
+        if here is None or there is None:
+            return []
+        pairs = []
+        if (nx, ny) == (cx + 1, cy):        # 东
+            for y in range(cy * CHUNK_SIZE, (cy + 1) * CHUNK_SIZE):
+                exit_cell = ((cx + 1) * CHUNK_SIZE - 1, y)
+                entry_cell = ((cx + 1) * CHUNK_SIZE, y)
+                if here.passable(exit_cell) and there.passable(entry_cell):
+                    pairs.append((exit_cell, entry_cell))
+        elif (nx, ny) == (cx - 1, cy):      # 西
+            for y in range(cy * CHUNK_SIZE, (cy + 1) * CHUNK_SIZE):
+                exit_cell = (cx * CHUNK_SIZE, y)
+                entry_cell = (cx * CHUNK_SIZE - 1, y)
+                if here.passable(exit_cell) and there.passable(entry_cell):
+                    pairs.append((exit_cell, entry_cell))
+        elif (nx, ny) == (cx, cy + 1):      # 南
+            for x in range(cx * CHUNK_SIZE, (cx + 1) * CHUNK_SIZE):
+                exit_cell = (x, (cy + 1) * CHUNK_SIZE - 1)
+                entry_cell = (x, (cy + 1) * CHUNK_SIZE)
+                if here.passable(exit_cell) and there.passable(entry_cell):
+                    pairs.append((exit_cell, entry_cell))
+        elif (nx, ny) == (cx, cy - 1):      # 北
+            for x in range(cx * CHUNK_SIZE, (cx + 1) * CHUNK_SIZE):
+                exit_cell = (x, cy * CHUNK_SIZE)
+                entry_cell = (x, cy * CHUNK_SIZE - 1)
+                if here.passable(exit_cell) and there.passable(entry_cell):
+                    pairs.append((exit_cell, entry_cell))
+        return pairs
+
+    # ---------- 更新 ----------
+    def observe(self, cells, obstacles) -> int:
+        """合并新观察（cells 含障碍格）。返回内容实际变化的区块数。"""
+        changed: dict[tuple[int, int], ChunkNavigationSummary] = {}
+        for cell in cells:
+            cell = tuple(cell)
+            s = self._summary_for(cell)
+            if cell not in s.known_cells:
+                s.known_cells.add(cell)
+                changed[s.chunk] = s
+        for cell in obstacles:
+            cell = tuple(cell)
+            s = self._summary_for(cell)
+            if cell not in s.known_cells or cell not in s.known_obstacles:
+                s.known_cells.add(cell)
+                s.known_obstacles.add(cell)
+                changed[s.chunk] = s
+        for s in changed.values():
+            self._recompute(s)
+        return len(changed)
+
+    def _summary_for(self, cell: tuple[int, int]) -> ChunkNavigationSummary:
+        chunk = chunk_of(cell)
+        s = self.chunks.get(chunk)
+        if s is None:
+            s = ChunkNavigationSummary(chunk=chunk)
+            self.chunks[chunk] = s
+        return s
+
+    def _recompute(self, s: ChunkNavigationSummary) -> None:
+        """内容变化后重算边界开放格与连通分量（区块内有限格）。"""
+        cx, cy = s.chunk
+        x0, y0 = cx * CHUNK_SIZE, cy * CHUNK_SIZE
+
+        openings = {}
+        for side in CHUNK_SIDES:
+            dx, dy = CHUNK_SIDE_NEIGHBOR[side]
+            edge = []
+            for i in range(CHUNK_SIZE):
+                if side in ("UP", "DOWN"):
+                    cell = (x0 + i, y0 if side == "UP" else y0 + CHUNK_SIZE - 1)
+                else:
+                    cell = (x0 if side == "LEFT" else x0 + CHUNK_SIZE - 1, y0 + i)
+                if s.passable(cell):
+                    edge.append(cell)
+            openings[side] = tuple(edge)
+        s.boundary_openings = openings
+
+        passable_cells = s.known_cells - s.known_obstacles
+        seen = set()
+        components = []
+        for cell in sorted(passable_cells):
+            if cell in seen:
+                continue
+            comp = {cell}
+            seen.add(cell)
+            queue = deque([cell])
+            while queue:
+                cur = queue.popleft()
+                for _, nxt in neighbors(cur):
+                    if nxt in passable_cells and nxt not in seen:
+                        seen.add(nxt)
+                        comp.add(nxt)
+                        queue.append(nxt)
+            components.append(frozenset(comp))
+        s.connected_components = tuple(components)
+        s.revision += 1
+
+    # ---------- 持久化 ----------
+    def to_dict(self) -> dict:
+        data = {}
+        for chunk, s in self.chunks.items():
+            data[f"{chunk[0]},{chunk[1]}"] = {
+                "revision": s.revision,
+                "known_cells": [list(c) for c in sorted(s.known_cells)],
+                "known_obstacles": [list(c) for c in sorted(s.known_obstacles)],
+                "boundary_openings": {
+                    side: [list(c) for c in cells]
+                    for side, cells in s.boundary_openings.items()
+                },
+            }
+        return data
+
+    def from_dict(self, data: dict) -> None:
+        """宽松加载：坏条目只丢该区块摘要，不影响其他区块。"""
+        self.chunks = {}
+        if not isinstance(data, dict):
+            return
+        for key, raw in data.items():
+            try:
+                xs, ys = str(key).split(",")
+                chunk = (int(xs), int(ys))
+                if not isinstance(raw, dict):
+                    continue
+                known_raw = raw.get("known_cells")
+                if known_raw is not None and not isinstance(known_raw, list):
+                    continue  # 该区块摘要损坏：整体丢弃
+                known = _parse_cell_set(known_raw)
+                obstacles = _parse_cell_set(raw.get("known_obstacles")) & known
+                revision = int(raw.get("revision", 0) or 0)
+            except (ValueError, TypeError, IndexError):
+                continue
+            s = ChunkNavigationSummary(chunk=chunk, known_cells=known,
+                                       known_obstacles=obstacles, revision=revision)
+            openings_raw = raw.get("boundary_openings")
+            if isinstance(openings_raw, dict):
+                for side, cells in openings_raw.items():
+                    if side in CHUNK_SIDES and isinstance(cells, list):
+                        parsed = _parse_cell_set(cells)
+                        s.boundary_openings[side] = tuple(sorted(parsed))
+            try:
+                self.chunks[chunk] = s
+                self._recompute(s)  # 连通分量不持久化，加载后重算
+                s.revision = revision  # 内容未变，保持持久化的版本号
+            except (ValueError, TypeError, IndexError):
+                self.chunks.pop(chunk, None)
+
+    def __len__(self) -> int:
+        return len(self.chunks)
+
+
+def _parse_cell_set(raw) -> set:
+    """严格解析 [[x, y], ...] 坐标列表；任何坏条目直接丢弃。"""
+    cells = set()
+    if not isinstance(raw, list):
+        return cells
+    for c in raw:
+        if isinstance(c, (list, tuple)) and len(c) == 2:
+            try:
+                cells.add((int(c[0]), int(c[1])))
+            except (ValueError, TypeError):
+                continue
+    return cells
+
+
 # ---------- 混合规划器（快速层 + 局部 A*） ----------
 
 @dataclass
@@ -498,6 +739,7 @@ class HybridPathPlanner:
         threat_penalty: int = 0,
         routes: dict | None = None,
         cache: RouteCache | None = None,
+        chunk_index: ChunkNavigationIndex | None = None,
         stats: PlannerStats | None = None,
     ) -> None:
         self.astar_max_expansions = max(1, astar_max_expansions)
@@ -508,6 +750,7 @@ class HybridPathPlanner:
         self.threat_penalty = threat_penalty
         self.routes: dict[str, WorkerRoute] = routes if routes is not None else {}
         self.cache = cache if cache is not None else RouteCache()
+        self.chunk_index = chunk_index
         self.stats = stats if stats is not None else PlannerStats()
         self.map_version = 0
         self.is_known: Callable[[tuple[int, int]], bool] | None = None
@@ -578,6 +821,17 @@ class HybridPathPlanner:
                     self.last_results[worker_id] = result
                     return result
                 replan = True
+
+        # 2.5) 跨区块走廊：启用区块索引且起终点异区块时，先规划到下一门户
+        if (self.chunk_index is not None
+                and manhattan(start, goal) > self.fast_path_distance
+                and chunk_of(start) != chunk_of(goal)):
+            result = self._cross_chunk_step(worker_id, start, goal, obstacles, occupied,
+                                            forbidden, allow_goal_occupied, threat,
+                                            replan=replan)
+            if result is not None:
+                self.last_results[worker_id] = result
+                return result
 
         # 2) 快速层：近距离且无失败/受阻记录（replan 时跳过，直接重规划）
         if not replan and self._fast_allowed(worker_id, start, goal):
@@ -726,6 +980,71 @@ class HybridPathPlanner:
             if fallback is not None:
                 return fallback
         return result
+
+    def _cross_chunk_step(self, worker_id, start, goal, obstacles, occupied, forbidden,
+                          allow_goal_occupied, threat, replan: bool = False) -> PathResult | None:
+        """跨区块规划：沿曼哈顿区块走廊逐段 A* 到下一边界门户。
+
+        任一步不满足（无门户、预算不足、段内失败）就返回 None，
+        退回普通 A*/BFS 前沿链；未知区块不会被标记为不可达。
+        """
+        index = self.chunk_index
+        corridor = index.corridor(chunk_of(start), chunk_of(goal))
+        if len(corridor) < 2:
+            return None
+        portals = index.portal_cells(corridor[0], corridor[1])
+        if not portals:
+            return None  # 下一区块未知或无已知门户：需要探索，退回普通 A*
+        best = min(portals, key=lambda pr: (manhattan(start, pr[0]) + manhattan(pr[1], goal),
+                                            pr[0][1], pr[0][0]))
+        portal = best[0]
+        if self._budget_left <= 0:
+            return None
+        cache_key = None
+        if not replan:
+            cache_key = RouteCacheKey(start, portal, self.map_version, "chunk")
+            cached = self.cache.get(cache_key)
+            if cached is not None and cached.status == FOUND and cached.steps:
+                first = cached.steps[0]
+                nx, ny = start[0] + DELTA[first][0], start[1] + DELTA[first][1]
+                if (nx, ny) not in obstacles and (nx, ny) not in occupied and (nx, ny) not in forbidden:
+                    self.stats.cache_hits += 1
+                    self.routes[worker_id] = WorkerRoute(
+                        target=goal, steps=cached.steps, next_index=1,
+                        map_version=self.map_version, planned_endpoint=portal,
+                        status=FOUND, start=start,
+                    )
+                    return PathResult(FOUND, (first,), portal, 0, cached.cost,
+                                      self.map_version, reason="chunk_cache_hit")
+                self.stats.replans += 1
+                cache_key = None
+            else:
+                self.stats.cache_misses += 1
+        request = PathRequest(
+            start=start, goal=portal, obstacles=obstacles, occupied=occupied,
+            forbidden=forbidden, allow_goal_occupied=allow_goal_occupied,
+            max_expansions=min(self.astar_max_expansions, self._budget_left),
+            unknown_penalty=self.unknown_penalty,
+            threat_penalty=self.threat_penalty,
+            threat=frozenset(threat),
+            is_known=self.is_known,
+            map_version=self.map_version,
+        )
+        result = astar_search(request)
+        self._budget_left = max(0, self._budget_left - result.expanded)
+        self.stats.astar_calls += 1
+        self.stats.expanded_nodes += result.expanded
+        if result.status != FOUND or not result.steps:
+            return None
+        self.routes[worker_id] = WorkerRoute(
+            target=goal, steps=result.steps, next_index=1,
+            map_version=self.map_version, planned_endpoint=portal,
+            status=FOUND, start=start,
+        )
+        if cache_key is not None:
+            self.cache.put(cache_key, result)
+        return PathResult(FOUND, (result.steps[0],), portal, result.expanded,
+                          result.cost, self.map_version, reason="chunk_segment")
 
     def _frontier_fallback(self, worker_id, start, goal, obstacles, occupied,
                            forbidden, mode: str) -> PathResult | None:

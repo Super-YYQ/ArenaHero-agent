@@ -1,5 +1,10 @@
 # -*- coding: utf-8 -*-
-"""地图记忆：障碍永久有效，资源点观察会过期（文档《地图与视野·探索记忆》）。"""
+"""地图记忆：障碍永久有效，资源点观察会过期（文档《地图与视野·探索记忆》）。
+
+schema_version=2 起新增 obstacle_revision 与 chunk_navigation 字段；
+旧版文件（无 schema_version）可正常加载；损坏的导航字段只丢摘要，
+不丢障碍与资源记忆。
+"""
 from __future__ import annotations
 
 import json
@@ -7,7 +12,10 @@ import os
 import time
 from pathlib import Path
 
+from pathfinding import ChunkNavigationIndex
+
 DEFAULT_PATH = Path(__file__).with_name("memory.json")
+SCHEMA_VERSION = 2
 
 
 class MapMemory:
@@ -22,6 +30,8 @@ class MapMemory:
         self.core_position: tuple[int, int] | None = None
         # 障碍版本号：新增永久障碍时单调递增，用于路线缓存失效
         self.obstacle_revision = 0
+        # 区块导航摘要（不作为可信执行计划；重连后只恢复静态摘要）
+        self.chunk_index = ChunkNavigationIndex()
         self._dirty = False
         self._last_save = 0.0
         self._load()
@@ -32,6 +42,13 @@ class MapMemory:
             return
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, ValueError, OSError):
+            # 整个文件损坏就丢弃重建，地图可以重新探索
+            self.obstacles = set()
+            self.resource_seen = {}
+            self.core_position = None
+            return
+        try:
             self.obstacles = {tuple(p) for p in data.get("obstacles", [])}
             self.obstacle_revision = int(data.get("obstacle_revision", 0) or 0)
             # 保存格式是 "x,y"；但历史版本可能存过列表或坏键，统一校验
@@ -52,11 +69,17 @@ class MapMemory:
                     continue
             core = data.get("core_position")
             self.core_position = tuple(core) if core else None
-        except (json.JSONDecodeError, ValueError, OSError):
-            # 记忆损坏就丢弃重建，地图可以重新探索
+        except (ValueError, TypeError, OSError):
             self.obstacles = set()
             self.resource_seen = {}
             self.core_position = None
+        # 导航摘要独立解析：损坏只丢摘要，绝不影响障碍与资源记忆
+        nav = data.get("chunk_navigation")
+        if nav is not None:
+            try:
+                self.chunk_index.from_dict(nav)
+            except Exception:
+                self.chunk_index = ChunkNavigationIndex()
 
     def maybe_save(self, interval: float = 30.0) -> None:
         now = time.monotonic()
@@ -66,10 +89,12 @@ class MapMemory:
 
     def save(self) -> None:
         data = {
+            "schema_version": SCHEMA_VERSION,
             "obstacles": [list(p) for p in self.obstacles],
             "resources": {f"{k[0]},{k[1]}": v for k, v in self.resource_seen.items()},
             "core_position": list(self.core_position) if self.core_position else None,
             "obstacle_revision": self.obstacle_revision,
+            "chunk_navigation": self.chunk_index.to_dict(),
         }
         tmp = self.path.with_suffix(".tmp")
         tmp.write_text(json.dumps(data), encoding="utf-8")
@@ -90,6 +115,15 @@ class MapMemory:
             # 新增永久障碍：版本号递增，触发路线缓存失效
             self.obstacle_revision += 1
             self._dirty = True
+        # 区块导航摘要：先更新障碍记忆，再更新索引（计划 §Phase6 观测顺序）
+        if self.chunk_index is not None:
+            cells = {tuple(c) for c in obstacle_cells}
+            if visible_cells is not None:
+                cells |= {tuple(c) for c in visible_cells}
+            else:
+                cells |= set(self.obstacles)
+            if self.chunk_index.observe(cells, self.obstacles) > 0:
+                self._dirty = True
         for cell in resource_cells:
             cell = tuple(cell)
             if cell not in self.resource_seen or self.resource_seen[cell] != tick:

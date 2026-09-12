@@ -10,9 +10,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from pathfinding import (
+    CHUNK_SIZE,
     DELTA,
     DIRECTIONS,
     RouteCache,
+    chunk_of,
     neighbors,
     step_direction,
 )
@@ -98,15 +100,8 @@ RESOURCE_COOLDOWN_TICKS = 8
 RESOURCE_NO_PROGRESS_TICKS = 6
 RESOURCE_MEMORY_TTL = 64
 REFILL_TICKS = 4
-CHUNK_SIZE = 32
+# CHUNK_SIZE 与 chunk_of 现于 pathfinding.py（区块导航摘要层），此处 re-export
 VISION = {"CORE": 5, "WORKER": 3, "VANGUARD": 4, "RANGER": 5}
-
-
-def chunk_of(cell: tuple[int, int]) -> tuple[int, int]:
-    """格子所属 32×32 区块（向下取整，与规则文档一致）。"""
-    x, y = cell
-    return (x // CHUNK_SIZE if x >= 0 else -((-x - 1) // CHUNK_SIZE) - 1,
-            y // CHUNK_SIZE if y >= 0 else -((-y - 1) // CHUNK_SIZE) - 1)
 
 
 def chunk_center(chunk: tuple[int, int]) -> tuple[int, int]:

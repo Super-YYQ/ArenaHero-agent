@@ -121,6 +121,9 @@ class Agent:
         pcfg = planner_config(cfg)
         self.pcfg = pcfg
         if pcfg["enable_path_planner"]:
+            use_chunks = pcfg["enable_chunk_navigation"]
+            if not use_chunks:
+                self.mem.chunk_index = None
             self.planner = HybridPathPlanner(
                 astar_max_expansions=pcfg["astar_max_expansions"],
                 frontier_max_expansions=pcfg["frontier_bfs_max_expansions"],
@@ -129,6 +132,7 @@ class Agent:
                 unknown_penalty=pcfg["unknown_cell_penalty"],
                 routes=self.strat.routes,
                 cache=self.strat.route_cache,
+                chunk_index=self.mem.chunk_index if use_chunks else None,
             )
             self.strat.route_cache.capacity = pcfg["route_cache_size"]
 
@@ -176,9 +180,11 @@ class Agent:
         )
         self.mem.maybe_save()
         # 地图版本同步：新增障碍会使旧路线/缓存失效（begin_tick 内处理）
+        # 观测顺序：observe 已更新 MapMemory 与 ChunkNavigationIndex，这里才规划
         self.strat.map_version = self.mem.obstacle_revision
         if self.planner is not None:
-            self.planner.begin_tick(self.strat.map_version)
+            is_known = self.mem.chunk_index.is_known if self.mem.chunk_index else None
+            self.planner.begin_tick(self.strat.map_version, is_known=is_known)
         # 记录本 Tick 视野覆盖到的 32×32 区块，供侦察选「最久未见」
         for cell in visible_cells:
             self.strat.chunk_last_seen[chunk_of(cell)] = tick
