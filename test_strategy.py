@@ -519,9 +519,10 @@ def _simulate_worker_to_goal(fixture_name: str, max_ticks: int = 300, use_planne
     obstacles, start, goal = get_fixture(fixture_name)
     obstacles = set(obstacles)
     planner = HybridPathPlanner() if use_planner else None
-    planner.begin_tick(0) if planner else None
     pos, last_pos = start, None
     for tick in range(1, max_ticks + 1):
+        if planner:
+            planner.begin_tick(0)  # 与 agent 一致：每 Tick 重置预算
         worker = {"id": "w1", "pos": pos, "cargo": 0, "last_pos": last_pos}
         action, args = decide_worker(
             worker, (0, 0), {"w1": goal}, obstacles, {pos}, set(), planner=planner,
@@ -865,9 +866,10 @@ def test_planner_astar_budget_falls_back_to_bfs_frontier():
     assert r.status == FRONTIER
     assert r.reason == "approach_frontier"
     assert p.stats.bfs_calls == 1
-    # 沿前沿逐 Tick 推进最终到达
+    # 沿前沿逐 Tick 推进最终到达（每 Tick 重置预算，与 agent 一致）
     pos, arrived = (0, 0), False
     for _ in range(300):
+        p.begin_tick(0)
         r = p.next_step("w", pos, (10, 0), obstacles=_POCKET_WALL, occupied={pos})
         if r.status == "AT_TARGET":
             arrived = True
