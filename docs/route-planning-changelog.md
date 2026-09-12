@@ -39,6 +39,15 @@
   情报日志(Beacon 坐标全服公开)。
 - 尚未实现:主动进攻、Beacon 夺取、Core 迁移朝原点搬家——等经济有余力再评估。
 
+## 追加:攒钱模式与生产保留金(2026-09-12 傍晚)
+
+- `hoard_mode`(默认 false):暂停一切 Unit 生产;配合 `hoard_until_resources`
+  (0=不限)时,库存达到目标即自动恢复生产并保持。
+- `min_spawn_reserve`(默认 0,原 config 里的死配置启用):只在
+  `resources - price ≥ reserve` 时才生产——边攒钱边扩军,库存不跌破保留线。
+- 注意容量墙:Core 容量 = max(10, 人口×5),人口 10 只能装 50;
+  想把库存存到 95 需先扩人口(调大 `max_workers`),再开攒钱。
+
 ## 移动调用点清单(Phase 0 记录)
 
 ### strategy.py

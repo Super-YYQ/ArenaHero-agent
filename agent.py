@@ -48,6 +48,9 @@ PLANNER_DEFAULTS = {
     "enable_chunk_navigation": True,
     "enable_chunk_sweep": True,
     "enemy_threat_penalty": 30,
+    "hoard_mode": False,
+    "hoard_until_resources": 0,
+    "min_spawn_reserve": 0,
 }
 # 数值型配置的合理上限，超出视为非法
 PLANNER_INT_LIMITS = {
@@ -58,6 +61,7 @@ PLANNER_INT_LIMITS = {
     "fast_path_distance": 64,
     "unknown_cell_penalty": 100,
     "enemy_threat_penalty": 1_000,
+    "hoard_until_resources": 100_000,
 }
 
 
@@ -123,6 +127,9 @@ class Agent:
             "blocked": 0, "arrivals": 0, "cooldowns": 0,
         }
         self.last_stats_log_tick = 0
+        # 攒钱模式日志去重
+        self._hoard_announced = False
+        self._hoard_released = False
         pcfg = planner_config(cfg)
         self.pcfg = pcfg
         if pcfg["enable_path_planner"]:
@@ -425,15 +432,30 @@ class Agent:
             from arena_hero import CoreState
             if core.view.state != CoreState.NORMAL:
                 return  # 迁移中不能生产
+            # 攒钱模式：暂停一切生产；设置了目标库存时，达标后永久恢复生产
+            if self.pcfg["hoard_mode"] and not self._hoard_released:
+                target = self.pcfg["hoard_until_resources"]
+                if target > 0 and turn.resources >= target:
+                    self._hoard_released = True
+                    log.info("tick %s: 攒钱目标达成（%s/%s），恢复生产",
+                             turn.tick, turn.resources, target)
+                else:
+                    if not self._hoard_announced:
+                        self._hoard_announced = True
+                        log.info("tick %s: 攒钱模式生效，暂停生产（目标库存 %s）",
+                                 turn.tick, target if target > 0 else "不限")
+                    return
+            reserve = self.pcfg.get("min_spawn_reserve", 0)
+            # min_spawn_reserve：只在 resources - price ≥ reserve 时才生产，保住底仓
             if n_workers < self.cfg["max_workers"]:
                 price = unit_cost(UnitType.WORKER, turn.state.population)
-                if turn.resources >= price:
+                if turn.resources >= price + reserve:
                     core.spawn(UnitType.WORKER)
                     log.info("tick %s: 生产 Worker（%s/%s），价格 %s", turn.tick, n_workers + 1, self.cfg["max_workers"], price)
                     return
             if n_vanguards < self.cfg["max_vanguards"] and n_workers >= 3:
                 price = unit_cost(UnitType.VANGUARD, turn.state.population)
-                if turn.resources >= price:
+                if turn.resources >= price + reserve:
                     core.spawn(UnitType.VANGUARD)
                     log.info("tick %s: 生产 Vanguard 自卫（%s/%s），价格 %s", turn.tick, n_vanguards + 1, self.cfg["max_vanguards"], price)
         except Exception:

@@ -14,5 +14,7 @@
   "unknown_cell_penalty": 1,
   "enable_chunk_navigation": true,
   "enable_chunk_sweep": true,
-  "enemy_threat_penalty": 30
+  "enemy_threat_penalty": 30,
+  "hoard_mode": false,
+  "hoard_until_resources": 0
 }

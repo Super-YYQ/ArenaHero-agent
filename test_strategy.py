@@ -1486,6 +1486,83 @@ def test_memory_enemy_cores_persist_and_correct():
     assert MapMemory(tmp).enemy_cores == {}
 
 
+# ---------- 攒钱模式与生产保留金 ----------
+from arena_hero import CoreState, UnitType
+
+
+class _FakeCoreView:
+    state = CoreState.NORMAL
+
+
+class _FakeCore:
+    def __init__(self):
+        self.view = _FakeCoreView()
+        self.spawned = []
+
+    def spawn(self, unit_type):
+        self.spawned.append(unit_type)
+
+
+def _fake_turn(resources, population=10, tick=1):
+    import types
+    return types.SimpleNamespace(
+        resources=resources, tick=tick,
+        state=types.SimpleNamespace(population=population))
+
+
+def _hoard_agent(extra_cfg=None):
+    import tempfile
+
+    from agent import Agent
+    from memory import MapMemory
+    tmp = Path(tempfile.mkdtemp()) / "m.json"
+    cfg = {"enable_path_planner": False, "max_workers": 10, "max_vanguards": 2}
+    cfg.update(extra_cfg or {})
+    return Agent(cfg, mem=MapMemory(tmp))
+
+
+def test_hoard_mode_blocks_all_spawns():
+    """攒钱模式：无论资源多少都不生产。"""
+    ag = _hoard_agent({"hoard_mode": True})
+    core = _FakeCore()
+    ag._decide_core(_fake_turn(20), core, n_workers=5, n_vanguards=0)
+    assert core.spawned == [], "攒钱模式下不应生产任何 Unit"
+
+
+def test_hoard_releases_when_target_reached():
+    """设置目标库存：达标前暂停，达标后恢复生产并保持。"""
+    ag = _hoard_agent({"hoard_mode": True, "hoard_until_resources": 50})
+    core = _FakeCore()
+    ag._decide_core(_fake_turn(49), core, n_workers=5, n_vanguards=0)
+    assert core.spawned == []
+    ag._decide_core(_fake_turn(50), core, n_workers=5, n_vanguards=0)
+    assert core.spawned == [UnitType.WORKER], "达标后恢复生产"
+    ag._decide_core(_fake_turn(8), core, n_workers=6, n_vanguards=0)
+    assert len(core.spawned) == 2, "恢复后不再回到攒钱状态"
+
+
+def test_min_spawn_reserve_keeps_buffer():
+    """保留金：只在 resources - price ≥ reserve 时才生产。"""
+    ag = _hoard_agent({"min_spawn_reserve": 10})
+    core = _FakeCore()
+    ag._decide_core(_fake_turn(12), core, n_workers=5, n_vanguards=0)
+    assert core.spawned == [], "12-5=7 < 10 不应生产"
+    ag._decide_core(_fake_turn(20), core, n_workers=5, n_vanguards=0)
+    assert core.spawned == [UnitType.WORKER], "20-5=15 ≥ 10 应生产"
+
+
+def test_normal_spawn_without_hoard_unchanged():
+    """不开攒钱/保留金时生产行为与旧版一致。"""
+    ag = _hoard_agent()
+    core = _FakeCore()
+    ag._decide_core(_fake_turn(5), core, n_workers=5, n_vanguards=0)
+    assert core.spawned == [UnitType.WORKER]
+    ag2 = _hoard_agent({"min_spawn_reserve": 0})
+    core2 = _FakeCore()
+    ag2._decide_core(_fake_turn(10), core2, n_workers=10, n_vanguards=0)
+    assert core2.spawned == [UnitType.VANGUARD], "Worker 满编后按旧逻辑补 Vanguard"
+
+
 def load_tests(loader, tests, pattern):
     """让 `python -m unittest discover` 也能执行本文件的普通函数测试。"""
     import unittest
