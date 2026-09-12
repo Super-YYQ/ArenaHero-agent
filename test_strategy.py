@@ -1345,7 +1345,25 @@ def test_sweep_due_refill_chunk_gets_priority():
     state2.chunk_last_probe[(1, 0)] = 4
     workers2 = [{"id": "w1", "pos": (0, 0), "cargo": 0}]
     assign_explore_targets(workers2, {}, (0, 0), state2, 4)
-    assert chunk_of(workers2[0]["explore_target"]) != (1, 0) or True
+    assert chunk_of(workers2[0]["explore_target"]) != (1, 0)
+
+
+def test_sweep_keeps_active_chunks_spread():
+    """多 Worker 同时认领时,活跃区块两两保持切比雪夫距离 ≥2,不再挤在同一片。"""
+    from strategy import StrategyState, assign_explore_targets
+    state = StrategyState()
+    workers = [{"id": f"w{i}", "pos": (0, 0), "cargo": 0} for i in range(1, 8)]
+    assign_explore_targets(workers, {}, (0, 0), state, 1)
+    chunks = [state.sweep_assign[w["id"]] for w in workers]
+    assert len(set(chunks)) == len(chunks)
+    for i in range(len(chunks)):
+        for j in range(i + 1, len(chunks)):
+            a, b = chunks[i], chunks[j]
+            gap = max(abs(a[0] - b[0]), abs(a[1] - b[1]))
+            assert gap >= 2, f"活跃区块 {a} 与 {b} 相距 {gap}, 会造成 Worker 重叠"
+    # 延续:Worker 未被打断时保持自己的区块
+    assign_explore_targets(workers, {}, (0, 0), state, 2)
+    assert [state.sweep_assign[w["id"]] for w in workers] == chunks
 
 
 def test_sweep_skips_obstacle_points():

@@ -118,6 +118,7 @@ VISION = {"CORE": 5, "WORKER": 3, "VANGUARD": 4, "RANGER": 5}
 SWEEP_CHUNK_RADIUS = 2            # Core 周边 5×5 个区块纳入扫掠
 SWEEP_LINE_OFFSETS = (3, 10, 17, 24, 31)   # 行距 7：视野 ±3 无缝覆盖 32 行
 SWEEP_POINT_X_OFFSETS = (2, 8, 14, 20, 29)  # 首点 ≤3、末点 ≥28，行走沿线全覆盖
+SWEEP_MIN_CHUNK_GAP = 2           # 活跃区块最小切比雪夫距离：防止多 Worker 挤在同一片
 
 
 def chunk_sweep_points(chunk: tuple[int, int]) -> list[tuple[int, int]]:
@@ -392,18 +393,21 @@ def assign_explore_targets(
         return due
 
     def sweep_next(wid: str, due_set: set) -> tuple[int, int] | None:
-        """取下一个扫掠停留点：到期复查区块优先，其余按上次扫掠完成时间轮转。"""
+        """取下一个扫掠停留点。
+
+        优先延续当前区块（最省路程）；到期复查区块（补点在等）次之，且不受
+        间隔约束；新认领区块与所有活跃区块保持切比雪夫距离 ≥
+        SWEEP_MIN_CHUNK_GAP，避免多 Worker 挤在同一片区域重复覆盖。
+        """
         core_chunk = chunk_of(core_pos)
         r = SWEEP_CHUNK_RADIUS
         cands = [(core_chunk[0] + dx, core_chunk[1] + dy)
                  for dx in range(-r, r + 1) for dy in range(-r, r + 1)]
         cands.sort(key=lambda ch: (
-            0 if ch in due_set else 1,
             state.chunk_last_swept.get(ch, -1),
             abs(ch[0] - core_chunk[0]) + abs(ch[1] - core_chunk[1]), ch))
-        for ch in cands:
-            if ch in state.sweep_claims:
-                continue
+
+        def advance(ch: tuple[int, int]) -> tuple[int, int] | None:
             points = chunk_sweep_points(ch)
             idx = state.sweep_cursor.get(ch, 0)
             while idx < len(points) and points[idx] in obstacles:
@@ -414,13 +418,44 @@ def assign_explore_targets(
                 state.chunk_last_swept[ch] = tick
                 if ch in due_set:
                     state.chunk_last_probe[ch] = tick
-                continue
+                return None
             state.sweep_cursor[ch] = idx + 1
             state.sweep_assign[wid] = ch
             state.sweep_claims.add(ch)
             if ch in due_set:
                 state.chunk_last_probe[ch] = tick
             return points[idx]
+
+        def fresh(ch: tuple[int, int]) -> bool:
+            """本 Tick 刚扫完的区块本轮不再重复认领。"""
+            return state.chunk_last_swept.get(ch, -1) != tick
+
+        cur = state.sweep_assign.get(wid)
+        if cur is not None and fresh(cur):
+            point = advance(cur)
+            if point is not None:
+                return point
+        # 到期复查区块：补点已经生成在等，优先去扫，允许靠近活跃区块
+        for ch in cands:
+            if ch in due_set and ch not in state.sweep_claims and fresh(ch):
+                point = advance(ch)
+                if point is not None:
+                    return point
+        # 新区块：与所有活跃区块保持间隔
+        for ch in cands:
+            if ch in state.sweep_claims or not fresh(ch):
+                continue
+            if all(max(abs(ch[0] - c2[0]), abs(ch[1] - c2[1])) >= SWEEP_MIN_CHUNK_GAP
+                   for c2 in state.sweep_claims):
+                point = advance(ch)
+                if point is not None:
+                    return point
+        # 放宽间隔兜底（Worker 数超过间隔可容纳数时）
+        for ch in cands:
+            if ch not in state.sweep_claims and fresh(ch):
+                point = advance(ch)
+                if point is not None:
+                    return point
         return None
 
     def pick_new(wid: str, avoid: set[tuple[int, int]]) -> tuple[int, int]:
