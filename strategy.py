@@ -142,6 +142,16 @@ def pick_raid_target(
     return best[1] if best else None
 
 
+def split_home_guard(vanguard_ids: list[str], home_guard_count: int) -> set[str]:
+    """留家守卫分配:按 id 排序,前 home_guard_count 个留守,其余出征。
+
+    决定性与兵力无关的顺序,避免部队频繁在家/出征之间摇摆。
+    """
+    if home_guard_count <= 0:
+        return set()
+    return set(sorted(vanguard_ids)[:home_guard_count])
+
+
 def ranger_shoot_cell(
     pos: tuple[int, int],
     enemies: list[dict],
@@ -888,15 +898,15 @@ def decide_vanguard(
     occupied: set[tuple[int, int]],
     planner=None,
     raid_target: tuple[int, int] | None = None,
-    war_armed: bool = False,
     threat_zones: set[tuple[int, int]] | None = None,
 ) -> tuple[str, tuple]:
-    """Vanguard 自卫与出征：有敌近身先打；战争状态下向目标 Core 行军围攻；
+    """Vanguard 自卫与出征：有敌近身先打；被指派出征时向目标 Core 行军围攻；
     否则守在 Core 旁相邻空位（绝不蹲交付口）。
 
     enemies: [{'id','pos','unit_type'}] 当前可见敌方对象（含敌方 Core）。
     SWEEP 不需要目标 UUID，也绝不会伤到自己人，直接朝敌方所在相邻格打。
-    raid_target/war_armed 由 agent 在战争开启且库存达保留线时传入；
+    raid_target 由 agent 按"兵数超过留家数"指派——出征与生产解耦:
+    库存门槛只管补员,已出征的部队不管库存如何都继续作战。
     planner 用于跨区长途行军（贪心单步会卡死在障碍上）。
     """
     pos = vanguard["pos"]
@@ -921,9 +931,9 @@ def decide_vanguard(
                 return ("move", (d,))
         return ("wait", ())
 
-    # 出征：战争状态下向目标 Core 行军；到达相邻位后上面的
+    # 出征：被指派目标时向其行军；到达相邻位后上面的
     # adjacent_enemies 分支自动 SWEEP 围攻（相邻 1 格 = SWEEP 射程）
-    if war_armed and raid_target is not None:
+    if raid_target is not None:
         if abs(pos[0] - raid_target[0]) + abs(pos[1] - raid_target[1]) > 1:
             if planner is not None:
                 r = planner.next_step(
@@ -964,11 +974,10 @@ def decide_ranger(
     occupied: set[tuple[int, int]],
     planner=None,
     raid_target: tuple[int, int] | None = None,
-    war_armed: bool = False,
     threat_zones: set[tuple[int, int]] | None = None,
 ) -> tuple[str, tuple]:
     """Ranger：射程（横/竖/斜 1~3 格）内见敌就射（优先敌方 Core）；
-    战争状态随队出征，行进到目标相邻位开火；否则回 Core 旁待命。"""
+    被指派出征时随队行军,到目标相邻位开火；否则回 Core 旁待命。"""
     pos = ranger["pos"]
     # 1) 射程内最优目标
     cell = ranger_shoot_cell(pos, enemies, obstacles)
@@ -987,7 +996,7 @@ def decide_ranger(
         return ("wait", ())
 
     # 3) 出征：行军到目标相邻位（相邻必在射程内,停下开火）
-    if war_armed and raid_target is not None:
+    if raid_target is not None:
         if abs(pos[0] - raid_target[0]) + abs(pos[1] - raid_target[1]) > 1:
             if planner is not None:
                 r = planner.next_step(

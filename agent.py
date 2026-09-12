@@ -32,6 +32,7 @@ from strategy import (
     enemy_threat_cells,
     pick_raid_target,
     refill_tick_at_or_after,
+    split_home_guard,
     visible_from,
 )
 
@@ -58,6 +59,7 @@ PLANNER_DEFAULTS = {
     "war_mode": False,
     "war_reserve": 0,
     "max_rangers": 0,
+    "vanguard_home_guard": 1,
 }
 # 数值型配置的合理上限，超出视为非法
 PLANNER_INT_LIMITS = {
@@ -70,6 +72,7 @@ PLANNER_INT_LIMITS = {
     "enemy_threat_penalty": 1_000,
     "hoard_until_resources": 100_000,
     "hoard_min_population": 200,
+    "vanguard_home_guard": 50,
 }
 
 
@@ -290,13 +293,13 @@ class Agent:
         if new_bases:
             log.info("tick %s: 发现 %s 个敌方基地：%s", tick, new_bases,
                      [(pos, owner) for pos, owner in enemy_core_obs])
-        # ---- 战争状态：war_mode 开启且库存达保留线(war_reserve) → 建军出征 ----
-        war_armed = (self.pcfg["war_mode"]
-                     and (self.pcfg["war_reserve"] <= 0
-                          or turn.resources >= self.pcfg["war_reserve"]))
-        raid_target = pick_raid_target(self.mem.enemy_cores, core_pos) if war_armed else None
-        if war_armed and raid_target != self._last_raid_target:
-            log.info("tick %s: 战争状态，出征目标 %s（剩余目标 %s 个）",
+        # ---- 战争模式：出征按"兵数超留家数"持续进行;war_reserve 只管补员门槛 ----
+        war_ongoing = self.pcfg["war_mode"]
+        military_ok = war_ongoing and (self.pcfg["war_reserve"] <= 0
+                                       or turn.resources >= self.pcfg["war_reserve"])
+        raid_target = pick_raid_target(self.mem.enemy_cores, core_pos) if war_ongoing else None
+        if war_ongoing and raid_target != self._last_raid_target:
+            log.info("tick %s: 战争模式，出征目标 %s（记忆中敌方基地 %s 个）",
                      tick, raid_target, len(self.mem.enemy_cores))
             self._last_raid_target = raid_target
         beacon = getattr(turn, "beacon", None)
@@ -338,14 +341,15 @@ class Agent:
         self._run_workers(turn, workers, core_pos, assignment, obstacles, occupied,
                           threat_cells, enemy_zones, tick)
 
-        # ---- Vanguard 行动：留 1 个守家（id 最小），其余随队出征 ----
-        home_guard_id = min((v["id"] for v in vanguards), default=None)
+        # ---- Vanguard 行动：留 vanguard_home_guard 个守家,其余随队出征 ----
+        home_guard_ids = split_home_guard([v["id"] for v in vanguards],
+                                          self.pcfg["vanguard_home_guard"])
         for v, vdict in zip(turn.vanguards, vanguards):
             try:
-                raid = raid_target if (war_armed and vdict["id"] != home_guard_id) else None
+                raid = raid_target if vdict["id"] not in home_guard_ids else None
                 action, args = decide_vanguard(
                     vdict, core_pos, enemies, obstacles, occupied,
-                    planner=self.planner, raid_target=raid, war_armed=war_armed,
+                    planner=self.planner, raid_target=raid,
                     threat_zones=enemy_zones,
                 )
                 log.info("tick %s: vanguard %s @%s -> %s %s%s",
@@ -365,7 +369,7 @@ class Agent:
                 action, args = decide_ranger(
                     rdict, core_pos, enemies, obstacles, occupied,
                     planner=self.planner, raid_target=raid_target,
-                    war_armed=war_armed, threat_zones=enemy_zones,
+                    threat_zones=enemy_zones,
                 )
                 log.info("tick %s: ranger %s @%s -> %s %s",
                          tick, rdict["id"][:8], rdict["pos"], action, args)
@@ -379,7 +383,7 @@ class Agent:
 
         # ---- Core 行动：优先补 Worker，够数后补 Vanguard ----
         self._decide_core(turn, core, len(workers), len(vanguards),
-                          len(turn.rangers), war_armed)
+                          len(turn.rangers), military_ok)
 
         turn.submit()
         self._log_progress(tick, turn)
@@ -510,7 +514,7 @@ class Agent:
             log.exception("ranger %s 执行 %s 失败", r.id, action)
 
     def _decide_core(self, turn, core, n_workers: int, n_vanguards: int,
-                     n_rangers: int = 0, war_armed: bool = False) -> None:
+                     n_rangers: int = 0, military_ok: bool | None = None) -> None:
         try:
             from arena_hero import CoreState
             if core.view.state != CoreState.NORMAL:
@@ -524,10 +528,10 @@ class Agent:
             # 攒钱模式：暂停一切生产；设置了目标库存时，达标后永久恢复生产。
             # hoard_min_population：人口未达标前先正常扩张（容量=人口×5，
             # 过早攒钱会被容量墙卡死——库存款不进、人口不涨）。
-            # 战争状态(war_armed)优先：攒够了就该花在建军上。
-            if (self.pcfg["hoard_mode"] and not self._hoard_released
-                    and n_workers >= self.pcfg["hoard_min_population"]
-                    and not war_armed):
+            # 战争模式下攒钱暂停让位:补员门槛由 war_reserve 控制,边采集边扫荡。
+            if (self.pcfg["hoard_mode"] and not self.pcfg["war_mode"]
+                    and not self._hoard_released
+                    and n_workers >= self.pcfg["hoard_min_population"]):
                 target = self.pcfg["hoard_until_resources"]
                 if target > 0 and turn.resources >= target:
                     self._hoard_released = True
@@ -539,8 +543,8 @@ class Agent:
                         log.info("tick %s: 攒钱模式生效，暂停生产（目标库存 %s）",
                                  turn.tick, target if target > 0 else "不限")
                     return
-            # 战争模式下,军备(Vanguard/Ranger)只在库存达保留线(war_reserve)后生产
-            military_ok = (not self.pcfg["war_mode"]) or war_armed
+            if military_ok is None:
+                military_ok = True  # 非战争模式:军备按上限正常生产(守家行为)
             # min_spawn_reserve：只在 resources - price ≥ reserve 时才生产，保住底仓
             if n_workers < self.cfg["max_workers"]:
                 price = unit_cost(UnitType.WORKER, turn.state.population)

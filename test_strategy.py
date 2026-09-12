@@ -1717,28 +1717,26 @@ def test_pick_raid_target_nearest():
 
 
 def test_vanguard_raid_march():
-    """战争状态 + 出征目标:Vanguard 向目标行军(即使方向背离 Core)。"""
+    """被指派出征:Vanguard 向目标行军(即使方向背离 Core),与库存无关。"""
     from pathfinding import HybridPathPlanner
     p = HybridPathPlanner()
     p.begin_tick(0)
     v = {"id": "v1", "pos": (10, 0), "hp": 4, "hp_max": 4}
     action, args = decide_vanguard(v, (0, 0), [], set(), {(10, 0)},
-                                   planner=p, raid_target=(40, 0), war_armed=True)
+                                   planner=p, raid_target=(40, 0))
     assert action == "move" and args[0] == "RIGHT", "应向出征目标行军"
     # 已到相邻位:无敌可见时原地待命(下一 Tick 目标入视野即 SWEEP)
     v2 = {"id": "v1", "pos": (39, 0), "hp": 4, "hp_max": 4}
     action2, _ = decide_vanguard(v2, (0, 0), [], set(), {(39, 0)},
-                                 planner=p, raid_target=(40, 0), war_armed=True)
+                                 planner=p, raid_target=(40, 0))
     assert action2 == "wait"
 
 
 def test_vanguard_without_raid_still_guards():
-    """未出征(未武装/无目标)时保持守家行为。"""
+    """未被指派出征时保持守家行为。"""
     v = {"id": "v1", "pos": (4, 0)}
-    action, args = decide_vanguard(v, (0, 0), [], set(), {(4, 0)}, war_armed=True)
+    action, args = decide_vanguard(v, (0, 0), [], set(), {(4, 0)})
     assert action == "move" and args[0] == "LEFT"
-    action2, _ = decide_vanguard(v, (0, 0), [], set(), {(4, 0)}, war_armed=False)
-    assert action2 == "move" and args[0] == "LEFT"
 
 
 def test_ranger_shoots_enemy_core_in_range():
@@ -1769,8 +1767,7 @@ def test_ranger_shoot_blocked_by_obstacle():
     r = {"id": "r1", "pos": (0, 0), "hp": 2, "hp_max": 2}
     enemies = [{"pos": (3, 0), "unit_type": None, "hp": 5}]
     action, args = decide_ranger(r, (0, 0), enemies, {(1, 0)}, {(0, 0)},
-                                 raid_target=(6, 0), war_armed=True,
-                                 planner=None)
+                                 raid_target=(6, 0), planner=None)
     assert action != "shoot", "射线被挡不得射击"
 
 
@@ -1806,25 +1803,49 @@ def test_vanguard_heals_at_core_when_damaged():
 
 
 def test_decide_core_war_gating():
-    """war_reserve:库存未达保留线不生产军备,达到后恢复。"""
+    """war_reserve 门槛:military_ok=False 不补军备,True 恢复补员。"""
     ag = _hoard_agent({"war_mode": True, "war_reserve": 100,
                        "max_workers": 19, "max_vanguards": 2})
     core = _FakeCore()
-    ag._decide_core(_fake_turn(50), core, n_workers=19, n_vanguards=0, war_armed=False)
+    ag._decide_core(_fake_turn(50), core, n_workers=19, n_vanguards=0, military_ok=False)
     assert core.spawned == [], "未达保留线不建军"
-    ag._decide_core(_fake_turn(100), core, n_workers=19, n_vanguards=0, war_armed=True)
-    assert core.spawned == [UnitType.VANGUARD], "达标后建军"
+    ag._decide_core(_fake_turn(100), core, n_workers=19, n_vanguards=0, military_ok=True)
+    assert core.spawned == [UnitType.VANGUARD], "达标后补员"
 
 
-def test_war_armed_overrides_hoard():
-    """战争状态解除攒钱暂停:该买军备就买。"""
+def test_war_mode_lifts_hoard_pause():
+    """战争模式下攒钱暂停让位:补员照常,边采集边扫荡。"""
     ag = _hoard_agent({"hoard_mode": True, "hoard_until_resources": 200,
                        "hoard_min_population": 19, "max_workers": 19,
                        "war_mode": True, "war_reserve": 50,
                        "max_vanguards": 2})
     core = _FakeCore()
-    ag._decide_core(_fake_turn(60), core, n_workers=19, n_vanguards=0, war_armed=True)
-    assert core.spawned == [UnitType.VANGUARD], "战争状态优先于攒钱暂停"
+    ag._decide_core(_fake_turn(60), core, n_workers=19, n_vanguards=0, military_ok=True)
+    assert core.spawned == [UnitType.VANGUARD], "战争模式优先于攒钱暂停"
+
+
+def test_split_home_guard():
+    """留家守卫分配:兵数超过留家数的部分出征,确定性不摇摆。"""
+    from strategy import split_home_guard
+    ids = ["aaa", "bbb", "ccc", "ddd"]
+    assert split_home_guard(ids, 1) == {"aaa"}
+    assert split_home_guard(ids, 2) == {"aaa", "bbb"}
+    assert split_home_guard(ids, 0) == set()
+    assert split_home_guard(ids, 10) == set(ids)
+
+
+def test_military_replenish_gate():
+    """补员门槛:库存低于 war_reserve(military_ok=False)时暂缓补员,
+    空间/资源恢复后自动补;Worker 生产不受战争门槛影响。"""
+    ag = _hoard_agent({"war_mode": True, "war_reserve": 80,
+                       "max_workers": 19, "max_vanguards": 2})
+    core = _FakeCore()
+    # 库存 60 < 80:military_ok=False → 不补 Vanguard;Worker 满编也不会生产
+    ag._decide_core(_fake_turn(60), core, n_workers=19, n_vanguards=0, military_ok=False)
+    assert core.spawned == []
+    # 库存恢复 → 补员
+    ag._decide_core(_fake_turn(85), core, n_workers=19, n_vanguards=0, military_ok=True)
+    assert core.spawned == [UnitType.VANGUARD]
 
 
 def load_tests(loader, tests, pattern):
