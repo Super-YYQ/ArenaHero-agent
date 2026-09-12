@@ -521,8 +521,8 @@ def decide_worker(
     """返回 (action, args)，action ∈ {'harvest','deposit','move','wait'}。
 
     优先级：受威胁撤退 > 满载回 Core > 到位采集 > 按任务移动。
-    planner 非空时，撤退/回 Core/去资源的移动统一交给混合规划器；
-    planner 为 None 时保持旧的单步贪心行为（回归兼容）。
+    planner 非空时，撤退/回 Core/去资源/侦察四类移动统一交给混合规划器；
+    planner 为 None 时保持旧的单步贪心行为（回归兼容，含侦察 away 兜底）。
     """
     pos = worker["pos"]
     last_pos = worker.get("last_pos")
@@ -551,8 +551,14 @@ def decide_worker(
             return move_or_wait(r)
         target = assignment.get(wid)
         if target is None:
-            # 侦察移动：本阶段保留旧逻辑，Phase 6 接入规划器
-            return _scout_move(worker, core_pos, obstacles, occupied, forbidden)
+            # 侦察：航点作为普通路线目标交给规划器；BLOCKED 由探索前沿兜底
+            explore = worker.get("explore_target")
+            if explore is None or pos == explore:
+                # 到点停下，下一 Tick 由 assign_explore_targets 换目标
+                return ("wait", ())
+            r = planner.next_step(wid, pos, explore, obstacles=obstacles, occupied=occupied,
+                                  forbidden=forbidden, goal_kind="scout")
+            return move_or_wait(r)
         if pos == target:
             # 只有当前视野确认该格仍有资源才 harvest，否则原地等重新分配
             visible = worker.get("visible_resources")
@@ -602,7 +608,7 @@ def _scout_move(
     occupied: set[tuple[int, int]],
     forbidden: set[tuple[int, int]],
 ) -> tuple[str, tuple]:
-    """旧侦察移动：走向探索航点；走不通沿远离 Core 的轴再试一次。"""
+    """旧侦察移动（仅 planner=None 的回退路径）：走向探索航点；走不通沿远离 Core 的轴再试一次。"""
     pos = worker["pos"]
     explore = worker.get("explore_target")
     if explore is not None and pos == explore:

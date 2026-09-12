@@ -1080,6 +1080,81 @@ def test_agent_chunk_navigation_toggle():
     assert on.planner.is_known is None  # begin_tick 前未注入
 
 
+# ---------- Phase 6：侦察接入与统一观测反馈 ----------
+
+def test_decide_worker_planner_scout_moves_and_waits():
+    """规划器接管侦察移动；到点停；无航点 wait（不再走 away 兜底）。"""
+    from pathfinding import HybridPathPlanner
+    p = HybridPathPlanner()
+    p.begin_tick(0)
+    w = {"id": "w1", "pos": (0, 0), "cargo": 0, "explore_target": (5, 0)}
+    action, args = decide_worker(w, (0, 0), {}, set(), set(), set(), planner=p)
+    assert (action, args) == ("move", ("RIGHT",))
+    # 到点停下
+    w2 = {"id": "w1", "pos": (5, 0), "cargo": 0, "explore_target": (5, 0)}
+    assert decide_worker(w2, (0, 0), {}, set(), set(), set(), planner=p) == ("wait", ())
+    # 无航点：wait
+    w3 = {"id": "w1", "pos": (0, 0), "cargo": 0}
+    assert decide_worker(w3, (0, 0), {}, set(), set(), set(), planner=p) == ("wait", ())
+
+
+def test_planner_scout_routes_around_wall_to_waypoint():
+    """侦察航点在墙后：规划器绕行到达，不再两格振荡。"""
+    from map_fixtures import get_fixture
+    from pathfinding import DELTA, HybridPathPlanner
+    obstacles, start, goal = get_fixture("straight_wall")
+    p = HybridPathPlanner()
+    pos, last_pos = start, None
+    arrived = False
+    for tick in range(1, 60):
+        p.begin_tick(0)
+        w = {"id": "w1", "pos": pos, "cargo": 0, "explore_target": goal, "last_pos": last_pos}
+        action, args = decide_worker(w, (0, 0), {}, obstacles, {pos}, set(), planner=p)
+        if action == "move":
+            dx, dy = DELTA[args[0]]
+            last_pos, pos = pos, (pos[0] + dx, pos[1] + dy)
+        if pos == goal:
+            arrived = True
+            break
+    assert arrived, "侦察应绕墙到达航点"
+
+
+def test_agent_scout_blocked_abandons_waypoint():
+    """侦察航点确认不可达：记录 waypoint_last_seen 并放弃目标。"""
+    import tempfile
+
+    from agent import Agent
+    from map_fixtures import get_fixture
+    from memory import MapMemory
+    obstacles, start, goal = get_fixture("enclosed")
+    tmp = Path(tempfile.mkdtemp()) / "m.json"
+    agent = Agent({"enable_path_planner": True, "fast_path_distance": 0}, mem=MapMemory(tmp))
+    agent.planner.begin_tick(1)
+    agent.planner.next_step("w1", start, goal, obstacles=obstacles,
+                            occupied={start}, goal_kind="scout")
+    wdict = {"id": "w1", "pos": start, "cargo": 0, "explore_target": goal}
+    agent._handle_route_result(wdict, {}, tick=1)
+    assert agent.strat.waypoint_last_seen[goal] == 1
+    assert "w1" not in agent.strat.explore_targets
+
+
+def test_two_scouts_do_not_crosslock_via_cache():
+    """两个侦察共享规划器：目的地不冲突，动态占用互不污染静态路线。"""
+    from pathfinding import HybridPathPlanner
+    p = HybridPathPlanner()
+    p.begin_tick(0)
+    obstacles = {(3, 0)}
+    occupied = {(0, 0), (0, 1)}
+    r1 = p.next_step("w1", (0, 0), (6, 0), obstacles=obstacles, occupied=occupied)
+    r2 = p.next_step("w2", (0, 1), (0, 6), obstacles=obstacles, occupied=occupied)
+    assert r1.steps and r2.steps
+    from pathfinding import DELTA
+    d1 = (0 + DELTA[r1.steps[0]][0], 0 + DELTA[r1.steps[0]][1])
+    d2 = (0 + DELTA[r2.steps[0]][0], 1 + DELTA[r2.steps[0]][1])
+    assert d1 != d2, "两个侦察本 Tick 目的地不能相同"
+    assert d1 not in occupied and d2 not in occupied
+
+
 def load_tests(loader, tests, pattern):
     """让 `python -m unittest discover` 也能执行本文件的普通函数测试。"""
     import unittest

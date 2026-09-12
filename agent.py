@@ -311,7 +311,7 @@ class Agent:
 
     # ---------- 指令翻译 ----------
     def _handle_route_result(self, wdict: dict, assignment: dict, tick: int) -> None:
-        """规划器确认目标不可达时，沿用现有冷却/任务清理规则（不新增隐式冷却）。"""
+        """规划器确认目标不可达时，沿用现有冷却/任务清理与航点放弃规则。"""
         if self.planner is None:
             return
         result = self.planner.last_results.get(wdict["id"])
@@ -326,6 +326,14 @@ class Agent:
             self.route_stats["cooldowns"] = self.route_stats.get("cooldowns", 0) + 1
             log.info("tick %s: worker %s 目标 %s 确认不可达，冷却至 tick %s",
                      tick, wdict["id"][:8], target, tick + RESOURCE_COOLDOWN_TICKS)
+            return
+        # 侦察航点确认被已知障碍封死且无前沿：记录航点并放弃，下一 Tick 换目标
+        explore = wdict.get("explore_target")
+        if explore is not None:
+            self.strat.waypoint_last_seen[explore] = tick
+            self.strat.explore_targets.pop(wdict["id"], None)
+            log.info("tick %s: worker %s 侦察航点 %s 确认不可达，放弃",
+                     tick, wdict["id"][:8], explore)
 
     def _apply_worker(self, w, action: str, args: tuple, occupied: set) -> None:
         pos = (w.position[0], w.position[1])
