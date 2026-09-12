@@ -1574,6 +1574,23 @@ def test_sweep_prefers_chunks_near_worker():
     assert chunk_of(workers[0]["explore_target"]) == (-42, 49)
 
 
+def test_hoard_waits_for_min_population():
+    """hoard_min_population：人口未达标先正常扩军，达标后才进入攒钱。"""
+    ag = _hoard_agent({"hoard_mode": True, "hoard_until_resources": 95,
+                       "hoard_min_population": 19, "max_workers": 19})
+    core = _FakeCore()
+    # 人口 10 < 19：正常生产（不受攒钱模式影响）
+    ag._decide_core(_fake_turn(5), core, n_workers=10, n_vanguards=0)
+    assert core.spawned == [UnitType.WORKER]
+    # 人口 19 达标：进入攒钱
+    ag._decide_core(_fake_turn(5), core, n_workers=19, n_vanguards=0)
+    assert len(core.spawned) == 1, "人口达标后应暂停生产"
+    ag._decide_core(_fake_turn(94), core, n_workers=19, n_vanguards=0)
+    assert len(core.spawned) == 1, "攒钱期间不生产"
+    ag._decide_core(_fake_turn(95), core, n_workers=19, n_vanguards=0)
+    assert len(core.spawned) == 2, "达标(95)后恢复生产"
+
+
 def load_tests(loader, tests, pattern):
     """让 `python -m unittest discover` 也能执行本文件的普通函数测试。"""
     import unittest

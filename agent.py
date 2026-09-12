@@ -50,6 +50,7 @@ PLANNER_DEFAULTS = {
     "enemy_threat_penalty": 30,
     "hoard_mode": False,
     "hoard_until_resources": 0,
+    "hoard_min_population": 0,
     "min_spawn_reserve": 0,
 }
 # 数值型配置的合理上限，超出视为非法
@@ -62,6 +63,7 @@ PLANNER_INT_LIMITS = {
     "unknown_cell_penalty": 100,
     "enemy_threat_penalty": 1_000,
     "hoard_until_resources": 100_000,
+    "hoard_min_population": 200,
 }
 
 
@@ -432,8 +434,11 @@ class Agent:
             from arena_hero import CoreState
             if core.view.state != CoreState.NORMAL:
                 return  # 迁移中不能生产
-            # 攒钱模式：暂停一切生产；设置了目标库存时，达标后永久恢复生产
-            if self.pcfg["hoard_mode"] and not self._hoard_released:
+            # 攒钱模式：暂停一切生产；设置了目标库存时，达标后永久恢复生产。
+            # hoard_min_population：人口未达标前先正常扩张（容量=人口×5，
+            # 过早攒钱会被容量墙卡死——库存款不进、人口不涨）。
+            if (self.pcfg["hoard_mode"] and not self._hoard_released
+                    and n_workers >= self.pcfg["hoard_min_population"]):
                 target = self.pcfg["hoard_until_resources"]
                 if target > 0 and turn.resources >= target:
                     self._hoard_released = True
