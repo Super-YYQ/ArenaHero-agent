@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import heapq
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 # 四个正方向（服务端只接受这四种）
@@ -281,3 +281,268 @@ def _astar_once(request: PathRequest, respect_forbidden: bool) -> PathResult:
     # 可达空间穷尽仍未到目标：当前已知地图确认不可达
     return PathResult(BLOCKED, (), None, expansions, 0,
                       request.map_version, reason="no_path_in_known_map")
+
+
+# ---------- 混合规划器（快速层 + 局部 A*） ----------
+
+@dataclass
+class WorkerRoute:
+    """单个 Worker 的路线游标。只存在于内存，不持久化、不写入共享缓存。
+
+    start 是规划时的起点；cell_at(next_index) 是游标当前应处的格子，
+    用来检测 Worker 是否沿路线行进（被挡/被挤偏时错位，需要局部重规划）。
+    """
+    target: tuple[int, int]
+    steps: tuple[str, ...]
+    next_index: int
+    map_version: int
+    planned_endpoint: tuple[int, int]
+    status: str
+    start: tuple[int, int] = (0, 0)
+    replans: int = 0
+    blocked_ticks: int = 0
+
+    def cell_at(self, index: int) -> tuple[int, int]:
+        x, y = self.start
+        for d in self.steps[:index]:
+            dx, dy = DELTA[d]
+            x, y = x + dx, y + dy
+        return (x, y)
+
+
+@dataclass
+class PlannerStats:
+    """规划统计。字段含义见 Agent.route_stats；failures 按 reason 计数。"""
+    plans: int = 0
+    fast_steps: int = 0
+    astar_calls: int = 0
+    bfs_calls: int = 0
+    cache_hits: int = 0
+    cache_misses: int = 0
+    invalidated: int = 0
+    replans: int = 0
+    expanded_nodes: int = 0
+    frontier_returns: int = 0
+    budget_exhausted: int = 0
+    blocked: int = 0
+    arrivals: int = 0
+    cooldowns: int = 0
+    failures: dict = field(default_factory=dict)
+
+    def note_failure(self, reason: str) -> None:
+        self.failures[reason] = self.failures.get(reason, 0) + 1
+
+    def snapshot(self) -> dict:
+        data = {k: v for k, v in vars(self).items() if k != "failures"}
+        data["failures"] = dict(self.failures)
+        return data
+
+
+class HybridPathPlanner:
+    """快速层 + 局部 A* 的混合规划器。
+
+    - 快速层：近距离且无失败记录时沿用贪心单步（常数时间，行为与旧版一致）；
+    - A* 层：其余情况做有预算的确定性搜索，路线游标按 Worker 保存；
+    - 每 Tick 总预算 total_path_budget，耗尽后剩余 Worker 只能走快速层或 wait；
+    - 动态占用只影响当前请求；目标确认不可达时记录失败目标并交给调用方处理。
+    """
+
+    def __init__(
+        self,
+        *,
+        astar_max_expansions: int = 800,
+        frontier_max_expansions: int = 1200,
+        total_path_budget: int = 5000,
+        fast_path_distance: int = 12,
+        unknown_penalty: int = 1,
+        threat_penalty: int = 0,
+        routes: dict | None = None,
+        stats: PlannerStats | None = None,
+    ) -> None:
+        self.astar_max_expansions = max(1, astar_max_expansions)
+        self.frontier_max_expansions = max(1, frontier_max_expansions)
+        self.total_path_budget = max(1, total_path_budget)
+        self.fast_path_distance = fast_path_distance
+        self.unknown_penalty = unknown_penalty
+        self.threat_penalty = threat_penalty
+        self.routes: dict[str, WorkerRoute] = routes if routes is not None else {}
+        self.stats = stats if stats is not None else PlannerStats()
+        self.map_version = 0
+        self.is_known: Callable[[tuple[int, int]], bool] | None = None
+        self.last_results: dict[str, PathResult] = {}
+        self._budget_left = 0
+        # worker_id -> (goal, 连续快速层受阻次数)；达到阈值后跳过快速层
+        self._fast_blocks: dict[str, tuple[tuple[int, int], int]] = {}
+        # worker_id -> 确认不可达的目标集合（容量受限，版本变化时清空）
+        self._failed_goals: dict[str, set] = {}
+
+    # ---------- Tick 生命周期 ----------
+    def begin_tick(self, map_version: int, is_known=None) -> None:
+        """每 Tick 调用：刷新地图版本与总预算；版本变化即丢弃全部路线。"""
+        version_changed = map_version != self.map_version
+        self.map_version = map_version
+        self.is_known = is_known
+        self._budget_left = self.total_path_budget
+        if version_changed:
+            self.stats.invalidated += len(self.routes)
+            self.routes.clear()
+            self._failed_goals.clear()
+            self._fast_blocks.clear()
+
+    def stats_snapshot(self) -> dict:
+        return self.stats.snapshot()
+
+    # ---------- 单 Worker 决策 ----------
+    def next_step(
+        self,
+        worker_id: str,
+        start: tuple[int, int],
+        goal: tuple[int, int],
+        *,
+        obstacles,
+        occupied,
+        forbidden=frozenset(),
+        allow_goal_occupied: bool = False,
+        threat=frozenset(),
+        goal_kind: str = "harvest",
+    ) -> PathResult:
+        """决定本 Tick 的一步；返回的 PathResult.steps[0] 即当前动作。
+
+        goal_kind: 'harvest' | 'core' | 'scout'，只影响后续阶段的降级策略。
+        """
+        self.stats.plans += 1
+        if start == goal:
+            self.stats.arrivals += 1
+            self.routes.pop(worker_id, None)
+            result = PathResult(AT_TARGET, (), start, 0, 0, self.map_version)
+            self.last_results[worker_id] = result
+            return result
+
+        obstacles = frozenset(obstacles)
+        occupied = frozenset(occupied) - {start}
+        if allow_goal_occupied:
+            occupied = occupied - {goal}
+        forbidden = frozenset(forbidden)
+
+        # 1) 复用现有路线游标（动态占用每次重新验证，不进静态结构）
+        route = self.routes.get(worker_id)
+        if route is not None:
+            if route.target != goal or route.map_version != self.map_version:
+                self.routes.pop(worker_id, None)
+            else:
+                result = self._follow_route(route, worker_id, start, obstacles, occupied, forbidden)
+                if result is not None:
+                    self.last_results[worker_id] = result
+                    return result
+
+        # 2) 快速层：近距离且无失败/受阻记录
+        if self._fast_allowed(worker_id, start, goal):
+            d = step_direction(start, goal, obstacles, occupied, forbidden=forbidden)
+            if d is not None:
+                nx, ny = start[0] + DELTA[d][0], start[1] + DELTA[d][1]
+                if (nx, ny) not in forbidden:
+                    self.stats.fast_steps += 1
+                    self._fast_blocks.pop(worker_id, None)
+                    result = PathResult(FOUND, (d,), (nx, ny), 0, 1, self.map_version,
+                                        reason="fast_layer")
+                    self.last_results[worker_id] = result
+                    return result
+            prev = self._fast_blocks.get(worker_id, (goal, 0))
+            self._fast_blocks[worker_id] = (goal, prev[1] + 1 if prev[0] == goal else 1)
+
+        # 3) 局部 A*（预算内）
+        result = self._astar_step(worker_id, start, goal, obstacles, occupied, forbidden,
+                                  allow_goal_occupied, threat)
+        self.last_results[worker_id] = result
+        return result
+
+    # ---------- 内部 ----------
+    def _follow_route(self, route: WorkerRoute, worker_id: str, start,
+                      obstacles, occupied, forbidden) -> PathResult | None:
+        """路线游标对齐且首步可执行时发一步；错位/受阻返回 None 走重规划。"""
+        expected = route.cell_at(route.next_index)
+        if start != expected or route.next_index >= len(route.steps):
+            # 游标错位（被挡停/被挤偏）或走完未达：局部重规划
+            self.stats.replans += 1
+            self.routes.pop(worker_id, None)
+            return None
+        d = route.steps[route.next_index]
+        nx, ny = start[0] + DELTA[d][0], start[1] + DELTA[d][1]
+        if (nx, ny) in obstacles or (nx, ny) in occupied or (nx, ny) in forbidden:
+            # 首步被动态占用阻挡：局部重规划，不改静态地图、不污染路线
+            route.blocked_ticks += 1
+            self.stats.replans += 1
+            self.routes.pop(worker_id, None)
+            return None
+        route.next_index += 1
+        route.blocked_ticks = 0
+        if route.next_index >= len(route.steps):
+            self.routes.pop(worker_id, None)
+        return PathResult(route.status, (d,), route.planned_endpoint, 0,
+                          len(route.steps) - route.next_index, self.map_version,
+                          reason="route_cursor")
+
+    def _fast_allowed(self, worker_id: str, start, goal) -> bool:
+        if goal in self._failed_goals.get(worker_id, ()):
+            return False
+        blocked = self._fast_blocks.get(worker_id)
+        if blocked is not None and blocked[0] == goal and blocked[1] >= 2:
+            return False
+        return manhattan(start, goal) <= self.fast_path_distance
+
+    def _astar_step(self, worker_id, start, goal, obstacles, occupied, forbidden,
+                    allow_goal_occupied, threat) -> PathResult:
+        if self._budget_left <= 0:
+            self.stats.budget_exhausted += 1
+            self.stats.note_failure("tick_budget")
+            return PathResult(BUDGET_EXHAUSTED, (), None, 0, 0, self.map_version,
+                              reason="tick_budget")
+        request = PathRequest(
+            start=start, goal=goal, obstacles=obstacles, occupied=occupied,
+            forbidden=forbidden, allow_goal_occupied=allow_goal_occupied,
+            max_expansions=min(self.astar_max_expansions, self._budget_left),
+            unknown_penalty=self.unknown_penalty,
+            threat_penalty=self.threat_penalty,
+            threat=frozenset(threat),
+            is_known=self.is_known,
+            map_version=self.map_version,
+        )
+        result = astar_search(request)
+        self._budget_left = max(0, self._budget_left - result.expanded)
+        self.stats.astar_calls += 1
+        self.stats.expanded_nodes += result.expanded
+        if result.status == FOUND:
+            self._fast_blocks.pop(worker_id, None)
+            self._failed_goals.get(worker_id, set()).discard(goal)
+            self.routes[worker_id] = WorkerRoute(
+                target=goal, steps=result.steps, next_index=1,
+                map_version=self.map_version, planned_endpoint=result.endpoint,
+                status=result.status, start=start,
+            )
+        elif result.status == FRONTIER and result.steps:
+            self.stats.frontier_returns += 1
+            self.routes[worker_id] = WorkerRoute(
+                target=goal, steps=result.steps, next_index=1,
+                map_version=self.map_version, planned_endpoint=result.endpoint,
+                status=result.status, start=start,
+            )
+        elif result.status == BLOCKED:
+            self.stats.blocked += 1
+            self.stats.note_failure(result.reason)
+            self._failed_goals.setdefault(worker_id, set()).add(goal)
+            self._cap_failed_goals()
+            self.routes.pop(worker_id, None)
+        elif result.status == BUDGET_EXHAUSTED:
+            self.stats.budget_exhausted += 1
+            self.stats.note_failure(result.reason)
+        return result
+
+    def _cap_failed_goals(self, limit: int = 256) -> None:
+        """失败目标记录有容量上限，防止长期运行无界增长。"""
+        total = sum(len(s) for s in self._failed_goals.values())
+        if total <= limit:
+            return
+        for goals in self._failed_goals.values():
+            while goals and total > limit:
+                goals.pop()
+                total -= 1

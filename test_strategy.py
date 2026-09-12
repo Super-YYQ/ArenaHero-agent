@@ -510,6 +510,248 @@ def test_step_direction_negative_coords():
     assert step_direction((-4, -4), (-9, -4), set(), set()) == "LEFT"
 
 
+# ---------- Phase 2：混合规划器集成回归 ----------
+
+def _simulate_worker_to_goal(fixture_name: str, max_ticks: int = 300, use_planner: bool = True):
+    """单 Worker 沿决策函数走到目标的确定性仿真，返回到达所用 Tick（失败 None）。"""
+    from map_fixtures import get_fixture
+    from pathfinding import DELTA, HybridPathPlanner
+    obstacles, start, goal = get_fixture(fixture_name)
+    obstacles = set(obstacles)
+    planner = HybridPathPlanner() if use_planner else None
+    planner.begin_tick(0) if planner else None
+    pos, last_pos = start, None
+    for tick in range(1, max_ticks + 1):
+        worker = {"id": "w1", "pos": pos, "cargo": 0, "last_pos": last_pos}
+        action, args = decide_worker(
+            worker, (0, 0), {"w1": goal}, obstacles, {pos}, set(), planner=planner,
+        )
+        if action == "move":
+            dx, dy = DELTA[args[0]]
+            last_pos, pos = pos, (pos[0] + dx, pos[1] + dy)
+            assert pos not in obstacles, "走进障碍格"
+        else:
+            assert action in ("wait", "harvest"), f"意外动作 {action}"
+        if pos == goal:
+            return tick
+    return None
+
+
+def test_planner_reaches_goal_on_complex_fixtures():
+    """直墙/L 形/凹形/瓶颈：规划器都能到达，不因局部振荡提前放弃。"""
+    for name in ("straight_wall", "l_shape", "concave", "bottleneck"):
+        ticks = _simulate_worker_to_goal(name)
+        assert ticks is not None, f"{name} 未到达目标"
+
+
+def test_planner_fast_layer_matches_greedy():
+    """近距离无遮挡走快速层，动作与旧贪心一致。"""
+    from pathfinding import HybridPathPlanner
+    p = HybridPathPlanner()
+    p.begin_tick(0)
+    r = p.next_step("w", (0, 0), (3, 0), obstacles=set(), occupied=set())
+    assert r.status == "FOUND" and r.steps == ("RIGHT",)
+    assert r.reason == "fast_layer"
+    assert p.stats.fast_steps == 1 and p.stats.astar_calls == 0
+
+
+def test_planner_route_cursor_avoids_replanning():
+    """同一路线游标复用，不重复展开 A*；走完即 AT_TARGET。"""
+    from map_fixtures import get_fixture
+    from pathfinding import DELTA, HybridPathPlanner
+    obstacles, start, goal = get_fixture("cross_chunk")
+    p = HybridPathPlanner()
+    p.begin_tick(0)
+    pos, last_pos, arrived = start, None, False
+    for tick in range(1, 200):
+        r = p.next_step("w", pos, goal, obstacles=obstacles, occupied={pos})
+        if tick == 1:
+            assert p.stats.astar_calls == 1, "首步应完成一次 A*"
+        else:
+            assert p.stats.astar_calls == 1, f"tick {tick} 游标复用不应重新 A*"
+        if r.status == "AT_TARGET":
+            arrived = True
+            break
+        assert r.steps, f"tick {tick} 无动作"
+        dx, dy = DELTA[r.steps[0]]
+        last_pos, pos = pos, (pos[0] + dx, pos[1] + dy)
+    assert arrived, "长路线应沿游标走完"
+    assert pos == goal
+
+
+def test_planner_dynamic_block_triggers_local_replan():
+    """路线游标首步被动态占用阻挡：局部重规划换路，不把动态格写进静态结构。"""
+    from map_fixtures import get_fixture
+    from pathfinding import DELTA, HybridPathPlanner, steps_to_cells
+    obstacles, start, goal = get_fixture("cross_chunk")
+    p = HybridPathPlanner()
+    p.begin_tick(0)
+    r1 = p.next_step("w", start, goal, obstacles=obstacles, occupied={start})
+    assert r1.steps
+    dx, dy = DELTA[r1.steps[0]]
+    blocked_cell = (start[0] + dx, start[1] + dy)
+    # Worker 被挡住没有移动，同位置重新决策但首步格被占
+    r2 = p.next_step("w", start, goal, obstacles=obstacles,
+                     occupied={start, blocked_cell})
+    assert r2.steps and r2.steps[0] != r1.steps[0], "应局部重规划换一步"
+    assert p.stats.replans >= 1
+    # 新路线不得包含被占格
+    route_steps = p.routes["w"].steps if "w" in p.routes else r2.steps
+    assert blocked_cell not in set(steps_to_cells(start, route_steps))
+    assert blocked_cell not in set(steps_to_cells(start, r2.steps))
+
+
+def test_planner_blocked_records_failed_goal():
+    """确认不可达：返回 BLOCKED 并记录失败目标，快速层随后被抑制。"""
+    from map_fixtures import get_fixture
+    from pathfinding import BLOCKED, HybridPathPlanner
+    obstacles, start, goal = get_fixture("enclosed")
+    p = HybridPathPlanner(fast_path_distance=0)  # 强制走 A* 层
+    p.begin_tick(1)
+    r = p.next_step("w", start, goal, obstacles=obstacles, occupied=set())
+    assert r.status == BLOCKED
+    assert goal in p._failed_goals["w"]
+    r2 = p.next_step("w", start, goal, obstacles=obstacles, occupied=set())
+    assert r2.status == BLOCKED
+    # 换个目标不再被抑制，A* 正常找到路线
+    r3 = p.next_step("w", start, (2, 2), obstacles=set(), occupied=set())
+    assert r3.status == "FOUND"
+
+
+def test_planner_tick_budget_shared_and_never_blocked():
+    """总预算耗尽：后续 Worker 得到 BUDGET_EXHAUSTED，绝不误报 BLOCKED。"""
+    from map_fixtures import get_fixture
+    from pathfinding import BUDGET_EXHAUSTED, HybridPathPlanner
+    obstacles, _, goal = get_fixture("cross_chunk")
+    p = HybridPathPlanner(total_path_budget=10)
+    p.begin_tick(0)
+    r1 = p.next_step("a", (0, 0), goal, obstacles=obstacles, occupied=set())
+    assert p._budget_left == 0
+    r2 = p.next_step("b", (0, 0), goal, obstacles=obstacles, occupied=set())
+    assert r2.status == BUDGET_EXHAUSTED
+    assert r2.reason == "tick_budget"
+
+
+def test_planner_version_bump_clears_routes():
+    """地图版本递增（新增障碍）：全部路线游标丢弃，下一步重规划。"""
+    from pathfinding import HybridPathPlanner
+    p = HybridPathPlanner()
+    p.begin_tick(1)
+    p.next_step("w", (0, 0), (40, 5), obstacles=set(), occupied=set())
+    assert p.routes
+    p.begin_tick(2)
+    assert not p.routes
+    assert p.stats.invalidated >= 1
+
+
+def test_planner_core_goal_occupied_still_entered():
+    """回 Core：Core 格被占用也不放弃（交付例外），本步只走合法格。"""
+    from pathfinding import DELTA, HybridPathPlanner
+    p = HybridPathPlanner()
+    p.begin_tick(0)
+    r = p.next_step("w", (3, 0), (0, 0), obstacles=set(),
+                    occupied={(0, 0), (2, 0)}, allow_goal_occupied=True)
+    assert r.status == "FOUND" and r.steps
+    d = r.steps[0]
+    nxt = (3 + DELTA[d][0], 0 + DELTA[d][1])
+    assert nxt not in {(0, 0), (2, 0)}, "不得走进占用格"
+    # 后续 Tick 能把 Core 当目标继续规划（占用格会被 allow_goal_occupied 剔除）
+    r2 = p.next_step("w", nxt, (0, 0), obstacles=set(),
+                     occupied={(0, 0), (2, 0)}, allow_goal_occupied=True)
+    assert r2.status in ("FOUND", "AT_TARGET")
+
+
+def test_decide_worker_with_planner_matches_legacy_on_simple_maps():
+    """简单场景下，规划器开关不改变 Worker 决策结果。"""
+    w = {"id": "w1", "pos": (0, 0), "cargo": 0, "visible_resources": {(3, 0)}}
+    legacy = decide_worker(w, (0, 0), {"w1": (3, 0)}, set(), set(), set())
+    from pathfinding import HybridPathPlanner
+    p = HybridPathPlanner()
+    p.begin_tick(0)
+    planned = decide_worker(w, (0, 0), {"w1": (3, 0)}, set(), set(), set(), planner=p)
+    assert legacy == planned == ("move", ("RIGHT",))
+    # 满载回 Core
+    w2 = {"id": "w2", "pos": (3, 3), "cargo": 2}
+    assert decide_worker(w2, (0, 0), {}, set(), set(), set()) == ("move", ("LEFT",)) \
+        or decide_worker(w2, (0, 0), {}, set(), set(), set()) == ("move", ("UP",))
+    p2 = HybridPathPlanner()
+    p2.begin_tick(0)
+    a1 = decide_worker(w2, (0, 0), {}, set(), set(), set())
+    a2 = decide_worker(w2, (0, 0), {}, set(), set(), set(), planner=p2)
+    assert a1 == a2
+
+
+def test_agent_blocked_resource_gets_cooldown():
+    """规划器确认资源不可达 → 沿用现有冷却/任务清理规则。"""
+    import tempfile
+
+    from agent import Agent
+    from map_fixtures import get_fixture
+    from memory import MapMemory
+    obstacles, start, goal = get_fixture("enclosed")
+    tmp = Path(tempfile.mkdtemp()) / "m.json"
+    # fast_path_distance=0 强制走 A* 层（否则近距目标会先走快速层）
+    agent = Agent({"enable_path_planner": True, "fast_path_distance": 0}, mem=MapMemory(tmp))
+    agent.planner.begin_tick(0)
+    agent.planner.next_step("w1", start, goal, obstacles=obstacles, occupied=set())
+    wdict = {"id": "w1", "pos": start, "cargo": 0}
+    agent._handle_route_result(wdict, {"w1": goal}, tick=10)
+    assert agent.strat.resource_cooldowns[("w1", goal)] > 10
+    assert "w1" not in agent.strat.worker_tasks
+
+
+def test_agent_planner_toggle_fallback():
+    """enable_path_planner=false 时回退旧实现；缺省开启且共享 routes。"""
+    import tempfile
+
+    from agent import Agent
+    from memory import MapMemory
+    tmp = Path(tempfile.mkdtemp()) / "m.json"
+    off = Agent({"enable_path_planner": False}, mem=MapMemory(tmp))
+    assert off.planner is None
+    on = Agent({}, mem=MapMemory(tmp))
+    assert on.planner is not None
+    assert on.planner.routes is on.strat.routes
+
+
+def test_planner_config_defaults_and_validation():
+    """旧 config 缺字段可启动；非法数值回退默认。"""
+    from agent import planner_config
+    cfg = planner_config({})
+    assert cfg["enable_path_planner"] is True
+    assert cfg["astar_max_expansions"] == 800
+    bad = planner_config({
+        "astar_max_expansions": -5,
+        "route_cache_size": "x",
+        "fast_path_distance": 10 ** 9,
+        "total_path_budget": True,
+        "unknown_cell_penalty": 3,
+    })
+    assert bad["astar_max_expansions"] == 800
+    assert bad["route_cache_size"] == 256
+    assert bad["fast_path_distance"] == 12
+    assert bad["total_path_budget"] == 5000
+    assert bad["unknown_cell_penalty"] == 3
+
+
+def test_memory_obstacle_revision_increments():
+    """新增障碍版本号递增；重复观察与资源变化不递增。"""
+    import tempfile
+
+    from memory import MapMemory
+    tmp = Path(tempfile.mkdtemp()) / "m.json"
+    mem = MapMemory(tmp)
+    mem.observe(1, [(2, 0)], [], (0, 0))
+    assert mem.obstacle_revision == 1
+    mem.observe(2, [(2, 0)], [], (0, 0))
+    assert mem.obstacle_revision == 1
+    mem.observe(3, [(3, 0)], [], (0, 0))
+    assert mem.obstacle_revision == 2
+    mem.observe(4, [], [(9, 9)], (0, 0))
+    assert mem.obstacle_revision == 2
+    assert mem.obstacle_revision > 0 and mem.resource_seen[(9, 9)] == 4
+
+
 def load_tests(loader, tests, pattern):
     """让 `python -m unittest discover` 也能执行本文件的普通函数测试。"""
     import unittest

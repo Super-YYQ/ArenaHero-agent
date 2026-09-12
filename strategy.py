@@ -73,6 +73,13 @@ class StrategyState:
     harvest_no_progress: dict[str, int] = field(default_factory=dict)
     # worker_id -> (target, best_dist, stalled)；绕墙无进展时冷却该点
     harvest_progress: dict[str, tuple[tuple[int, int], int, int]] = field(default_factory=dict)
+    # ---- 路线规划状态（与 HybridPathPlanner 共享；不持久化到 memory.json）----
+    # worker_id -> 当前路线游标
+    routes: dict = field(default_factory=dict)
+    # 静态路线缓存（Phase 3 起使用 RouteCacheKey）
+    route_cache: dict = field(default_factory=dict)
+    # 与 MapMemory.obstacle_revision 同步的地图版本
+    map_version: int = 0
 
 
 # 16 方向 × 4 环，半径 10/20/30/40。社区成熟方案（Drew-Z arena-hero-agent）。
@@ -513,14 +520,53 @@ def decide_worker(
     obstacles: set[tuple[int, int]],
     occupied: set[tuple[int, int]],
     threat_cells: set[tuple[int, int]],
+    planner=None,
 ) -> tuple[str, tuple]:
     """返回 (action, args)，action ∈ {'harvest','deposit','move','wait'}。
 
     优先级：受威胁撤退 > 满载回 Core > 到位采集 > 按任务移动。
+    planner 非空时，撤退/回 Core/去资源的移动统一交给混合规划器；
+    planner 为 None 时保持旧的单步贪心行为（回归兼容）。
     """
     pos = worker["pos"]
     last_pos = worker.get("last_pos")
     forbidden = {last_pos} if last_pos else set()
+
+    def move_or_wait(result) -> tuple[str, tuple]:
+        if result.steps:
+            return ("move", (result.steps[0],))
+        return ("wait", ())
+
+    if planner is not None:
+        wid = worker["id"]
+        # 遭遇敌人：向 Core 撤退（Worker 完全不能攻击）
+        if pos in threat_cells:
+            r = planner.next_step(wid, pos, core_pos, obstacles=obstacles, occupied=occupied,
+                                  forbidden=forbidden, allow_goal_occupied=True,
+                                  threat=threat_cells, goal_kind="core")
+            return move_or_wait(r)
+        if worker["cargo"] > 0:
+            if pos == core_pos:
+                return ("deposit", ())
+            # Core 格是占位实体，交付时必须走进去：allow_goal_occupied=True
+            r = planner.next_step(wid, pos, core_pos, obstacles=obstacles, occupied=occupied,
+                                  forbidden=forbidden, allow_goal_occupied=True,
+                                  goal_kind="core")
+            return move_or_wait(r)
+        target = assignment.get(wid)
+        if target is None:
+            # 侦察移动：本阶段保留旧逻辑，Phase 6 接入规划器
+            return _scout_move(worker, core_pos, obstacles, occupied, forbidden)
+        if pos == target:
+            # 只有当前视野确认该格仍有资源才 harvest，否则原地等重新分配
+            visible = worker.get("visible_resources")
+            if visible is None or target in visible:
+                return ("harvest", ())
+            return ("wait", ())
+        r = planner.next_step(wid, pos, target, obstacles=obstacles, occupied=occupied,
+                              forbidden=forbidden, goal_kind="harvest")
+        return move_or_wait(r)
+
     # 遭遇敌人：向 Core 撤退（Worker 完全不能攻击）
     if pos in threat_cells:
         d = step_direction(pos, core_pos, obstacles, occupied, forbidden=forbidden)
@@ -540,22 +586,7 @@ def decide_worker(
 
     target = assignment.get(worker["id"])
     if target is None:
-        # 附近没有已知资源：朝持久探索目标走，扩大视野。
-        # last_pos 禁止回头，避免 2 格振荡。
-        explore = worker.get("explore_target")
-        if explore is not None and pos == explore:
-            # 到点停下，下一 Tick 由 assign_explore_targets 换朝向；不要沿远离 Core 绕圈
-            return ("wait", ())
-        if explore and pos != explore:
-            d = step_direction(pos, explore, obstacles, occupied, forbidden=forbidden)
-            if d:
-                return ("move", (d,))
-        # 走不通：沿远离 Core 的轴再试一次
-        away = (pos[0] * 2 - core_pos[0], pos[1] * 2 - core_pos[1])
-        d = step_direction(pos, away, obstacles, occupied, forbidden=forbidden)
-        if d:
-            return ("move", (d,))
-        return ("wait", ())
+        return _scout_move(worker, core_pos, obstacles, occupied, forbidden)
     if pos == target:
         # 只有当前视野确认该格仍有资源才 harvest，否则原地等重新分配
         visible = worker.get("visible_resources")
@@ -563,6 +594,30 @@ def decide_worker(
             return ("harvest", ())
         return ("wait", ())
     d = step_direction(pos, target, obstacles, occupied, forbidden=forbidden)
+    if d:
+        return ("move", (d,))
+    return ("wait", ())
+
+
+def _scout_move(
+    worker: dict,
+    core_pos: tuple[int, int],
+    obstacles: set[tuple[int, int]],
+    occupied: set[tuple[int, int]],
+    forbidden: set[tuple[int, int]],
+) -> tuple[str, tuple]:
+    """旧侦察移动：走向探索航点；走不通沿远离 Core 的轴再试一次。"""
+    pos = worker["pos"]
+    explore = worker.get("explore_target")
+    if explore is not None and pos == explore:
+        # 到点停下，下一 Tick 由 assign_explore_targets 换朝向；不要沿远离 Core 绕圈
+        return ("wait", ())
+    if explore and pos != explore:
+        d = step_direction(pos, explore, obstacles, occupied, forbidden=forbidden)
+        if d:
+            return ("move", (d,))
+    away = (pos[0] * 2 - core_pos[0], pos[1] * 2 - core_pos[1])
+    d = step_direction(pos, away, obstacles, occupied, forbidden=forbidden)
     if d:
         return ("move", (d,))
     return ("wait", ())

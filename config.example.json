@@ -3,5 +3,14 @@
   "max_workers": 10,
   "max_vanguards": 2,
   "min_spawn_reserve": 0,
-  "log_level": "INFO"
+  "log_level": "INFO",
+  "enable_path_planner": true,
+  "path_planner_mode": "hybrid",
+  "astar_max_expansions": 800,
+  "frontier_bfs_max_expansions": 1200,
+  "total_path_budget": 5000,
+  "route_cache_size": 256,
+  "fast_path_distance": 12,
+  "unknown_cell_penalty": 1,
+  "enable_chunk_navigation": true
 }

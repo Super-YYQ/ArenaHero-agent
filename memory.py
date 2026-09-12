@@ -20,6 +20,8 @@ class MapMemory:
         self.resource_seen: dict[tuple[int, int], int] = {}
         # 自己 Core 的已知位置（Core 可能迁移，不是永久的）
         self.core_position: tuple[int, int] | None = None
+        # 障碍版本号：新增永久障碍时单调递增，用于路线缓存失效
+        self.obstacle_revision = 0
         self._dirty = False
         self._last_save = 0.0
         self._load()
@@ -31,6 +33,7 @@ class MapMemory:
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
             self.obstacles = {tuple(p) for p in data.get("obstacles", [])}
+            self.obstacle_revision = int(data.get("obstacle_revision", 0) or 0)
             # 保存格式是 "x,y"；但历史版本可能存过列表或坏键，统一校验
             self.resource_seen = {}
             for k, v in data.get("resources", {}).items():
@@ -66,6 +69,7 @@ class MapMemory:
             "obstacles": [list(p) for p in self.obstacles],
             "resources": {f"{k[0]},{k[1]}": v for k, v in self.resource_seen.items()},
             "core_position": list(self.core_position) if self.core_position else None,
+            "obstacle_revision": self.obstacle_revision,
         }
         tmp = self.path.with_suffix(".tmp")
         tmp.write_text(json.dumps(data), encoding="utf-8")
@@ -82,7 +86,10 @@ class MapMemory:
         """
         before = len(self.obstacles)
         self.obstacles |= {tuple(c) for c in obstacle_cells}
-        self._dirty |= len(self.obstacles) != before
+        if len(self.obstacles) != before:
+            # 新增永久障碍：版本号递增，触发路线缓存失效
+            self.obstacle_revision += 1
+            self._dirty = True
         for cell in resource_cells:
             cell = tuple(cell)
             if cell not in self.resource_seen or self.resource_seen[cell] != tick:

@@ -14,6 +14,7 @@ from pathlib import Path
 from arena_hero import ArenaHeroClient, Direction, UnitType, unit_cost
 
 from memory import MapMemory
+from pathfinding import HybridPathPlanner
 from strategy import (
     DELTA,
     RESOURCE_COOLDOWN_TICKS,
@@ -31,6 +32,52 @@ from strategy import (
 
 HERE = Path(__file__).parent
 log = logging.getLogger("agent")
+
+# 规划器配置默认值：旧 config.json 缺字段也能启动（见开发计划 §12）
+PLANNER_DEFAULTS = {
+    "enable_path_planner": True,
+    "path_planner_mode": "hybrid",
+    "astar_max_expansions": 800,
+    "frontier_bfs_max_expansions": 1200,
+    "total_path_budget": 5000,
+    "route_cache_size": 256,
+    "fast_path_distance": 12,
+    "unknown_cell_penalty": 1,
+    "enable_chunk_navigation": True,
+}
+# 数值型配置的合理上限，超出视为非法
+PLANNER_INT_LIMITS = {
+    "astar_max_expansions": 100_000,
+    "frontier_bfs_max_expansions": 100_000,
+    "total_path_budget": 1_000_000,
+    "route_cache_size": 65_536,
+    "fast_path_distance": 64,
+    "unknown_cell_penalty": 100,
+}
+
+
+def planner_config(cfg: dict) -> dict:
+    """合并规划器配置：缺字段用默认值；类型/范围非法时记录错误并回退默认。"""
+    merged = dict(PLANNER_DEFAULTS)
+    for key, default in PLANNER_DEFAULTS.items():
+        if key not in cfg:
+            continue
+        value = cfg[key]
+        if isinstance(default, bool):
+            if not isinstance(value, bool):
+                log.error("配置 %s=%r 应为布尔值，使用默认 %s", key, value, default)
+                continue
+        elif isinstance(default, int):
+            limit = PLANNER_INT_LIMITS.get(key)
+            if (not isinstance(value, int) or isinstance(value, bool)
+                    or value < 0 or (limit is not None and value > limit)):
+                log.error("配置 %s=%r 超出合理范围，使用默认 %s", key, value, default)
+                continue
+        else:
+            merged[key] = value
+            continue
+        merged[key] = value
+    return merged
 
 
 def setup_logging(level: str) -> Path:
@@ -56,9 +103,9 @@ def load_config() -> dict:
 
 
 class Agent:
-    def __init__(self, cfg: dict) -> None:
+    def __init__(self, cfg: dict, mem: MapMemory | None = None) -> None:
         self.cfg = cfg
-        self.mem = MapMemory()
+        self.mem = mem if mem is not None else MapMemory()
         self.strat = StrategyState()
         self.last_resources = None
         self.last_log_tick = 0
@@ -71,6 +118,17 @@ class Agent:
             "blocked": 0, "arrivals": 0, "cooldowns": 0,
         }
         self.last_stats_log_tick = 0
+        pcfg = planner_config(cfg)
+        self.pcfg = pcfg
+        if pcfg["enable_path_planner"]:
+            self.planner = HybridPathPlanner(
+                astar_max_expansions=pcfg["astar_max_expansions"],
+                frontier_max_expansions=pcfg["frontier_bfs_max_expansions"],
+                total_path_budget=pcfg["total_path_budget"],
+                fast_path_distance=pcfg["fast_path_distance"],
+                unknown_penalty=pcfg["unknown_cell_penalty"],
+                routes=self.strat.routes,
+            )
 
     # ---------- 主循环 ----------
     def run(self) -> None:
@@ -115,6 +173,10 @@ class Agent:
             visible_cells=visible_cells,
         )
         self.mem.maybe_save()
+        # 地图版本同步：新增障碍会使旧路线/缓存失效（begin_tick 内处理）
+        self.strat.map_version = self.mem.obstacle_revision
+        if self.planner is not None:
+            self.planner.begin_tick(self.strat.map_version)
         # 记录本 Tick 视野覆盖到的 32×32 区块，供侦察选「最久未见」
         for cell in visible_cells:
             self.strat.chunk_last_seen[chunk_of(cell)] = tick
@@ -208,7 +270,8 @@ class Agent:
         # ---- Worker 行动 ----
         for w, wdict in zip(turn.workers, workers):
             action, args = decide_worker(
-                wdict, core_pos, assignment, obstacles, occupied, threat_cells
+                wdict, core_pos, assignment, obstacles, occupied, threat_cells,
+                planner=self.planner,
             )
             log.info(
                 "tick %s: worker %s @%s cargo=%s -> %s %s (target=%s explore=%s)",
@@ -217,6 +280,7 @@ class Agent:
                 wdict.get("explore_target"),
             )
             self._apply_worker(w, action, args, occupied)
+            self._handle_route_result(wdict, assignment, tick)
             # 决策前位置记入 last_pos（给下一 Tick 禁止回头）。
             # stall：本 Tick 发出的动作不是 move，视为停在原地。
             if action != "move":
@@ -238,6 +302,23 @@ class Agent:
         self._maybe_log_route_stats(tick)
 
     # ---------- 指令翻译 ----------
+    def _handle_route_result(self, wdict: dict, assignment: dict, tick: int) -> None:
+        """规划器确认目标不可达时，沿用现有冷却/任务清理规则（不新增隐式冷却）。"""
+        if self.planner is None:
+            return
+        result = self.planner.last_results.get(wdict["id"])
+        if result is None or result.status != "BLOCKED":
+            return
+        target = assignment.get(wdict["id"])
+        if target is not None and wdict["cargo"] == 0:
+            # 与 assign_resources 的无进展冷却同一机制，只是确认不可达时提前触发
+            self.strat.resource_cooldowns[(wdict["id"], target)] = tick + RESOURCE_COOLDOWN_TICKS
+            self.strat.worker_tasks.pop(wdict["id"], None)
+            self.strat.harvest_progress.pop(wdict["id"], None)
+            self.route_stats["cooldowns"] = self.route_stats.get("cooldowns", 0) + 1
+            log.info("tick %s: worker %s 目标 %s 确认不可达，冷却至 tick %s",
+                     tick, wdict["id"][:8], target, tick + RESOURCE_COOLDOWN_TICKS)
+
     def _apply_worker(self, w, action: str, args: tuple, occupied: set) -> None:
         pos = (w.position[0], w.position[1])
         try:
