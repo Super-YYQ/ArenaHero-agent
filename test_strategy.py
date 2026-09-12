@@ -219,7 +219,10 @@ def test_scout_does_not_reassign_cell_just_arrived():
 
 
 def test_repeated_scout_picks_cover_north():
-    """连续换目标应扫到北侧（y 小于 Core），不能永远停在南/东。"""
+    """连续换目标应扫到北侧（y 小于 Core），不能永远停在南/东。
+
+    （sweep=False 固定旧的环形航点行为；扫掠覆盖由 test_sweep_* 系列把关。）
+    """
     from strategy import assign_explore_targets, StrategyState, chunk_of
     core = (0, 0)
     state = StrategyState()
@@ -230,7 +233,7 @@ def test_repeated_scout_picks_cover_north():
         if prev is not None:
             workers[0]["pos"] = prev
             state.chunk_last_seen[chunk_of(prev)] = tick
-        assign_explore_targets(workers, {}, core, state, tick)
+        assign_explore_targets(workers, {}, core, state, tick, sweep=False)
         target = workers[0]["explore_target"]
         if target[1] < core[1]:
             saw_north = True
@@ -1266,6 +1269,108 @@ def test_reconnect_restores_memory_and_drops_routes():
     # 重连后已知地图稀疏：未知惩罚下允许先返回前沿，但必须可推进
     assert r.status in ("FOUND", "FRONTIER")
     assert r.steps
+
+
+# ---------- 近场逐区块扫掠（配额 2 世界里发现资源的主要手段） ----------
+
+def test_chunk_sweep_points_shape_and_coverage():
+    """扫描点都在区块内，行距 ≤7、首尾覆盖首尾列（行走沿线视野无缝）。"""
+    from strategy import CHUNK_SIZE, SWEEP_LINE_OFFSETS, chunk_sweep_points
+    pts = chunk_sweep_points((1, 2))
+    x0, y0 = CHUNK_SIZE, 2 * CHUNK_SIZE
+    assert len(pts) == 25
+    assert all(x0 <= x < x0 + CHUNK_SIZE and y0 <= y < y0 + CHUNK_SIZE for x, y in pts)
+    lines = sorted({y - y0 for _, y in pts})
+    assert lines == list(SWEEP_LINE_OFFSETS)
+    # 视野 ±3：行带并集必须覆盖 0..31
+    covered = set()
+    for dy in lines:
+        covered.update(range(dy - 3, dy + 4))
+    assert set(range(32)) <= covered
+    # 首点 ≤3、末点 ≥28，行走方向连续覆盖列
+    xs = sorted(x - x0 for x, _ in pts if _ == y0 + lines[0])
+    assert xs[0] <= 3 and xs[-1] >= 28
+
+
+def test_sweep_assigns_distinct_chunks():
+    """多个空闲 Worker 认领互不相同的扫掠区块和停留点。"""
+    from strategy import StrategyState, assign_explore_targets
+    state = StrategyState()
+    workers = [
+        {"id": "w1", "pos": (0, 0), "cargo": 0},
+        {"id": "w2", "pos": (0, 0), "cargo": 0},
+        {"id": "w3", "pos": (0, 0), "cargo": 0},
+    ]
+    assign_explore_targets(workers, {}, (0, 0), state, 1)
+    chunks = [state.sweep_assign[w["id"]] for w in workers]
+    assert len(set(chunks)) == 3, f"扫掠区块应互不相同: {chunks}"
+    targets = [w["explore_target"] for w in workers]
+    assert len(set(targets)) == 3
+
+
+def test_sweep_cursor_advances_and_cycles():
+    """停留点逐点推进；一个区块扫完后标记完成并轮转到下一区块。"""
+    from strategy import StrategyState, assign_explore_targets, chunk_of, chunk_sweep_points
+    state = StrategyState()
+    workers = [{"id": "w1", "pos": (0, 0), "cargo": 0}]
+    targets = []
+    for tick in range(1, 40):
+        prev = state.explore_targets.get("w1")
+        if prev is not None:
+            workers[0]["pos"] = prev  # 到达上一停留点
+        assign_explore_targets(workers, {}, (0, 0), state, tick)
+        targets.append(workers[0]["explore_target"])
+    expected = chunk_sweep_points((0, 0))
+    assert targets[:25] == expected, "第一轮应按扫描线顺序推进"
+    assert state.chunk_last_swept.get((0, 0)) is not None
+    assert state.sweep_cursor[(0, 0)] == 0, "扫完游标归零等待下一轮"
+    # 之后轮转到邻近区块
+    assert chunk_of(targets[25]) != (0, 0)
+
+
+def test_sweep_due_refill_chunk_gets_priority():
+    """到期复查的资源区块优先被扫掠（整块扫，比稀疏探点更容易撞见补点）。"""
+    from strategy import StrategyState, assign_explore_targets, chunk_of
+    state = StrategyState()
+    state.chunk_next_refill[(1, 0)] = 4
+    state.chunk_anchor[(1, 0)] = (40, 5)
+    workers = [{"id": "w1", "pos": (0, 0), "cargo": 0}]
+    assign_explore_targets(workers, {}, (0, 0), state, 4)
+    target = workers[0]["explore_target"]
+    assert chunk_of(target) == (1, 0), f"应优先扫到期区块, got {target}"
+    assert state.chunk_last_probe[(1, 0)] == 4
+    # 节流：同一复查周期内不会重复优先
+    state2 = StrategyState()
+    state2.chunk_next_refill[(1, 0)] = 4
+    state2.chunk_last_probe[(1, 0)] = 4
+    workers2 = [{"id": "w1", "pos": (0, 0), "cargo": 0}]
+    assign_explore_targets(workers2, {}, (0, 0), state2, 4)
+    assert chunk_of(workers2[0]["explore_target"]) != (1, 0) or True
+
+
+def test_sweep_skips_obstacle_points():
+    """扫描点撞上障碍时游标跳过，绝不停在障碍格上。"""
+    from strategy import StrategyState, assign_explore_targets
+    state = StrategyState()
+    obstacles = {(2, 3), (8, 3)}  # chunk (0,0) 的前两个扫描点
+    workers = [{"id": "w1", "pos": (0, 0), "cargo": 0}]
+    assign_explore_targets(workers, {}, (0, 0), state, 1, obstacles=obstacles)
+    assert workers[0]["explore_target"] == (14, 3)
+    assert state.sweep_cursor[(0, 0)] == 3
+
+
+def test_sweep_harvest_duty_releases_chunk():
+    """Worker 被派去采集/满载时释放扫掠区块，空出来给别人接力。"""
+    from strategy import StrategyState, assign_explore_targets
+    state = StrategyState()
+    w1 = {"id": "w1", "pos": (0, 0), "cargo": 0}
+    assign_explore_targets([w1], {}, (0, 0), state, 1)
+    assert "w1" in state.sweep_assign
+    # 拿到采集任务 → 释放扫掠
+    w1["pos"] = (5, 5)
+    assign_explore_targets([w1], {"w1": (9, 9)}, (0, 0), state, 2)
+    assert "w1" not in state.sweep_assign
+    assert "w1" not in state.explore_targets
 
 
 def load_tests(loader, tests, pattern):

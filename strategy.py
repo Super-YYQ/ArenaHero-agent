@@ -76,6 +76,15 @@ class StrategyState:
     harvest_no_progress: dict[str, int] = field(default_factory=dict)
     # worker_id -> (target, best_dist, stalled)；绕墙无进展时冷却该点
     harvest_progress: dict[str, tuple[tuple[int, int], int, int]] = field(default_factory=dict)
+    # ---- 近场逐区块扫掠 ----
+    # chunk -> 下一个扫描停留点索引（全局游标，多 Worker 顺序接力）
+    sweep_cursor: dict[tuple[int, int], int] = field(default_factory=dict)
+    # chunk -> 上次完整扫掠完成的 tick
+    chunk_last_swept: dict[tuple[int, int], int] = field(default_factory=dict)
+    # worker_id -> 正在扫掠的区块
+    sweep_assign: dict[str, tuple[int, int]] = field(default_factory=dict)
+    # 本 Tick 已被认领的扫掠区块（每 Tick 重建）
+    sweep_claims: set = field(default_factory=set)
     # ---- 路线规划状态（与 HybridPathPlanner 共享；不持久化到 memory.json）----
     # worker_id -> 当前路线游标
     routes: dict = field(default_factory=dict)
@@ -102,6 +111,19 @@ RESOURCE_MEMORY_TTL = 64
 REFILL_TICKS = 4
 # CHUNK_SIZE 与 chunk_of 现于 pathfinding.py（区块导航摘要层），此处 re-export
 VISION = {"CORE": 5, "WORKER": 3, "VANGUARD": 4, "RANGER": 5}
+
+# ---- 近场逐区块扫掠 ----
+# 配额公式 max(2, floor(128/(8+ring)))：远离原点时每区块仅 2 个资源点，
+# 稀疏航点几乎撞不见；扫描线让 Worker 视野(半径 3)无缝覆盖整个区块。
+SWEEP_CHUNK_RADIUS = 2            # Core 周边 5×5 个区块纳入扫掠
+SWEEP_LINE_OFFSETS = (3, 10, 17, 24, 31)   # 行距 7：视野 ±3 无缝覆盖 32 行
+SWEEP_POINT_X_OFFSETS = (2, 8, 14, 20, 29)  # 首点 ≤3、末点 ≥28，行走沿线全覆盖
+
+
+def chunk_sweep_points(chunk: tuple[int, int]) -> list[tuple[int, int]]:
+    """区块的扫描线停留点：5 条横线 × 5 点，行走沿线时视野覆盖全部 32×32 格。"""
+    x0, y0 = chunk[0] * CHUNK_SIZE, chunk[1] * CHUNK_SIZE
+    return [(x0 + dx, y0 + dy) for dy in SWEEP_LINE_OFFSETS for dx in SWEEP_POINT_X_OFFSETS]
 
 
 def chunk_center(chunk: tuple[int, int]) -> tuple[int, int]:
@@ -321,8 +343,14 @@ def assign_explore_targets(
     state: StrategyState,
     tick: int,
     obstacles: set[tuple[int, int]] | None = None,
+    sweep: bool = True,
 ) -> None:
-    """给没有资源任务的空载 Worker 分配侦察目标。原地改 workers 与 state。"""
+    """给没有资源任务的空载 Worker 分配侦察目标。原地改 workers 与 state。
+
+    sweep=True 走"近场逐区块扫掠"：扫描线把 Core 周边 5×5 区块全覆盖，
+    到期复查的资源区块优先——配额制世界里这是发现资源点的主要手段。
+    sweep=False 保留旧的稀疏环形航点行为（回归兼容/fallback）。
+    """
     obstacles = obstacles or set()
 
     def reset_progress(wid: str) -> None:
@@ -352,8 +380,7 @@ def assign_explore_targets(
         else:
             state.no_progress_count[wid] = state.no_progress_count.get(wid, 0) + 1
 
-    def pick_new(wid: str, avoid: set[tuple[int, int]]) -> tuple[int, int]:
-        blocked = obstacles | avoid | state.scout_claims
+    def due_refill_chunks() -> list[tuple[int, int]]:
         due = []
         for ch, ready in state.chunk_next_refill.items():
             if ready > tick:
@@ -362,13 +389,55 @@ def assign_explore_targets(
             if last >= ready and tick - last < REFILL_TICKS:
                 continue
             due.append(ch)
-        due.sort(key=lambda ch: _manhattan(core_pos, state.chunk_anchor.get(ch, chunk_center(ch))))
-        for ch in due:
-            for cand in _chunk_recheck_points(ch, state.chunk_anchor.get(ch)):
-                if cand in blocked:
-                    continue
+        return due
+
+    def sweep_next(wid: str, due_set: set) -> tuple[int, int] | None:
+        """取下一个扫掠停留点：到期复查区块优先，其余按上次扫掠完成时间轮转。"""
+        core_chunk = chunk_of(core_pos)
+        r = SWEEP_CHUNK_RADIUS
+        cands = [(core_chunk[0] + dx, core_chunk[1] + dy)
+                 for dx in range(-r, r + 1) for dy in range(-r, r + 1)]
+        cands.sort(key=lambda ch: (
+            0 if ch in due_set else 1,
+            state.chunk_last_swept.get(ch, -1),
+            abs(ch[0] - core_chunk[0]) + abs(ch[1] - core_chunk[1]), ch))
+        for ch in cands:
+            if ch in state.sweep_claims:
+                continue
+            points = chunk_sweep_points(ch)
+            idx = state.sweep_cursor.get(ch, 0)
+            while idx < len(points) and points[idx] in obstacles:
+                idx += 1
+            if idx >= len(points):
+                # 本轮扫完：记录完成时间、游标归零，等待下一轮轮转
+                state.sweep_cursor[ch] = 0
+                state.chunk_last_swept[ch] = tick
+                if ch in due_set:
+                    state.chunk_last_probe[ch] = tick
+                continue
+            state.sweep_cursor[ch] = idx + 1
+            state.sweep_assign[wid] = ch
+            state.sweep_claims.add(ch)
+            if ch in due_set:
                 state.chunk_last_probe[ch] = tick
-                return cand
+            return points[idx]
+        return None
+
+    def pick_new(wid: str, avoid: set[tuple[int, int]]) -> tuple[int, int]:
+        if sweep:
+            point = sweep_next(wid, set(due_refill_chunks()))
+            if point is not None:
+                return point
+        else:
+            blocked = obstacles | avoid | state.scout_claims
+            due = due_refill_chunks()
+            due.sort(key=lambda ch: _manhattan(core_pos, state.chunk_anchor.get(ch, chunk_center(ch))))
+            for ch in due:
+                for cand in _chunk_recheck_points(ch, state.chunk_anchor.get(ch)):
+                    if cand in blocked:
+                        continue
+                    state.chunk_last_probe[ch] = tick
+                    return cand
         return pick_scout_target(
             core_pos,
             state.chunk_last_seen,
@@ -381,6 +450,7 @@ def assign_explore_targets(
         )
 
     state.scout_claims.clear()
+    state.sweep_claims.clear()
     for wdict in workers:
         wid = wdict["id"]
         if wid in assignment or wdict["cargo"] > 0:
@@ -389,12 +459,16 @@ def assign_explore_targets(
         if should_drop(wid, wdict, target):
             continue
         state.scout_claims.add(target)
+        cur_chunk = state.sweep_assign.get(wid)
+        if cur_chunk is not None:
+            state.sweep_claims.add(cur_chunk)
 
     for wdict in workers:
         wid = wdict["id"]
         wdict["last_pos"] = state.last_pos.get(wid)
         if wid in assignment or wdict["cargo"] > 0:
             state.explore_targets.pop(wid, None)
+            state.sweep_assign.pop(wid, None)
             reset_progress(wid)
             continue
         if wid not in state.scout_slots:
@@ -404,10 +478,10 @@ def assign_explore_targets(
         if should_drop(wid, wdict, target):
             if target is not None:
                 state.scout_slots[wid] = (state.scout_slots[wid] + 1) % len(SCOUT_VECTORS)
+                state.waypoint_last_seen[target] = tick
             avoid: set[tuple[int, int]] = set()
             if target is not None:
                 avoid.add(target)
-                state.waypoint_last_seen[target] = tick
             if target is not None and wdict["pos"] == target:
                 avoid.add(wdict["pos"])
             target = pick_new(wid, avoid)

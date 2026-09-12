@@ -44,6 +44,7 @@ PLANNER_DEFAULTS = {
     "fast_path_distance": 12,
     "unknown_cell_penalty": 1,
     "enable_chunk_navigation": True,
+    "enable_chunk_sweep": True,
 }
 # 数值型配置的合理上限，超出视为非法
 PLANNER_INT_LIMITS = {
@@ -269,10 +270,11 @@ class Agent:
             progress=self.strat.harvest_progress,
         )
 
-        # 没有资源任务的 Worker：环形侦察，目标选最久没扫过的区块。
-        # 卡住 SCOUT_STALL_TICKS 或到达目标 → 换下一个。
+        # 没有资源任务的 Worker：近场逐区块扫掠（发现资源点的主要手段），
+        # 卡住 SCOUT_STALL_TICKS 或到达停留点 → 前进到下一个扫描点。
         assign_explore_targets(
             workers, assignment, core_pos, self.strat, tick, obstacles=obstacles,
+            sweep=self.pcfg["enable_chunk_sweep"],
         )
 
         # ---- Worker 行动（单 Worker 异常隔离，绝不阻塞整 Tick 提交）----

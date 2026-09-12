@@ -3,6 +3,27 @@
 对应计划:`docs/superpowers/specs/2026-09-12-route-planning-development-plan.md`
 本文档记录每个已完成 Phase 的简短变更、移动调用点清单与基准结果。
 
+## 追加:近场逐区块扫掠(2026-09-12 下午)
+
+**背景**:该世界 Core 位于 ring≈94,配额公式 `max(2, floor(128/(8+ring)))`
+下每区块只有 2 个资源点;旧侦察航点(4 环 64 点)是稀疏线采样,3 天日志
+仅 24 次成功采集,库存常年 0-4/35,经济饿死。
+
+**改动**(`enable_chunk_sweep`,默认开启):
+
+- `chunk_sweep_points()`:区块内 5 条扫描线(行距 7,Worker 视野 ±3 无缝覆盖
+  全部 32 行)× 5 个停留点;行走沿线即覆盖整个区块。
+- `assign_explore_targets(sweep=True)`:空闲 Worker 按"到期复查区块优先 →
+  上次扫掠时间最旧优先"认领 Core 周边 5×5 区块,逐点推进扫描线;
+  全局游标 `sweep_cursor` 支持多 Worker 接力,`chunk_last_swept` 驱动轮转,
+  `sweep_claims` 防止同 Tick 重复认领;扫掠与采集循环闭环:
+  扫掠发现点 → `assign_resources` 分配采集 → 补充复查到期 → 再扫再采。
+- `sweep=False` 保留旧的稀疏环形航点行为(回归兼容)。
+
+**效果**:25 个邻近区块理论上限约 44 点/分钟;扫掠一轮(7 Worker)约 2-3 小时,
+相比此前 3 天 24 次采集是数量级提升。朝原点方向(ring 更低、配额更高)的
+远期扩张待经济转正后另行规划。
+
 ## 移动调用点清单(Phase 0 记录)
 
 ### strategy.py

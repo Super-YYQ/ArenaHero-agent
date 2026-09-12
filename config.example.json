@@ -12,5 +12,6 @@
   "route_cache_size": 256,
   "fast_path_distance": 12,
   "unknown_cell_penalty": 1,
-  "enable_chunk_navigation": true
+  "enable_chunk_navigation": true,
+  "enable_chunk_sweep": true
 }
