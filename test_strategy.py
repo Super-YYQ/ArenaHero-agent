@@ -466,6 +466,60 @@ def test_vanguard_guards_core_when_clear():
     assert action2 == "wait"
 
 
+# ---------- Phase 0：固定地图夹具与基线回归 ----------
+
+def test_fixture_sanity_bfs_oracle():
+    """夹具自检：除 enclosed 外全部可达，enclosed 确认不可达。"""
+    from map_fixtures import bfs_oracle, get_fixture
+    for name in ("empty", "straight_wall", "l_shape", "concave",
+                 "bottleneck", "negative_quadrant", "cross_chunk"):
+        obstacles, start, goal = get_fixture(name)
+        assert bfs_oracle(obstacles, start, goal) is not None, f"{name} 应可达"
+    obstacles, start, goal = get_fixture("enclosed")
+    assert bfs_oracle(obstacles, start, goal) is None, "enclosed 应不可达"
+
+
+def test_step_direction_regressions_on_fixtures():
+    """简单场景的 step_direction 动作保持不变（基线回归）。"""
+    from map_fixtures import get_fixture
+    obstacles, start, goal = get_fixture("empty")
+    assert step_direction(start, goal, obstacles, set()) == "RIGHT"
+
+    obstacles, start, goal = get_fixture("straight_wall")
+    assert step_direction(start, goal, obstacles, set()) == "RIGHT"
+    # 贴墙时才垂直绕行
+    d = step_direction((3, 0), goal, obstacles, set())
+    assert d in ("UP", "DOWN"), f"贴墙应垂直绕行, got {d}"
+
+    obstacles, start, goal = get_fixture("bottleneck")
+    assert step_direction(start, goal, obstacles, set()) == "RIGHT"
+
+    obstacles, start, goal = get_fixture("negative_quadrant")
+    d = step_direction(start, goal, obstacles, set())
+    assert d is not None
+
+    obstacles, start, goal = get_fixture("concave")
+    d = step_direction(start, goal, obstacles, set())
+    assert d is not None and d != "LEFT"
+
+
+def test_step_direction_negative_coords():
+    """负坐标下的方向计算与正坐标一致。"""
+    assert step_direction((-4, -4), (-1, -4), set(), set()) == "RIGHT"
+    assert step_direction((-4, -4), (-4, -9), set(), set()) == "UP"
+    assert step_direction((-4, -4), (-9, -4), set(), set()) == "LEFT"
+
+
+def load_tests(loader, tests, pattern):
+    """让 `python -m unittest discover` 也能执行本文件的普通函数测试。"""
+    import unittest
+    suite = unittest.TestSuite()
+    for name in sorted(globals()):
+        if name.startswith("test_"):
+            suite.addTest(unittest.FunctionTestCase(globals()[name]))
+    return suite
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

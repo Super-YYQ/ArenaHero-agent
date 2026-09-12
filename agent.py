@@ -62,6 +62,15 @@ class Agent:
         self.strat = StrategyState()
         self.last_resources = None
         self.last_log_tick = 0
+        # 路线规划统计（Phase 0 基线字段；规划器接入后由 planner 填充）
+        self.planner = None
+        self.route_stats = {
+            "plans": 0, "fast_steps": 0, "astar_calls": 0, "bfs_calls": 0,
+            "cache_hits": 0, "cache_misses": 0, "invalidated": 0, "replans": 0,
+            "expanded_nodes": 0, "frontier_returns": 0, "budget_exhausted": 0,
+            "blocked": 0, "arrivals": 0, "cooldowns": 0,
+        }
+        self.last_stats_log_tick = 0
 
     # ---------- 主循环 ----------
     def run(self) -> None:
@@ -226,6 +235,7 @@ class Agent:
 
         turn.submit()
         self._log_progress(tick, turn)
+        self._maybe_log_route_stats(tick)
 
     # ---------- 指令翻译 ----------
     def _apply_worker(self, w, action: str, args: tuple, occupied: set) -> None:
@@ -282,6 +292,15 @@ class Agent:
             log.exception("core 动作失败")
 
     # ---------- 日志 ----------
+    def _maybe_log_route_stats(self, tick: int) -> None:
+        """每 100 Tick 汇报一次路线统计，便于比较规划失败/停滞/动作量。"""
+        if tick - self.last_stats_log_tick < 100:
+            return
+        self.last_stats_log_tick = tick
+        if self.planner is not None:
+            self.route_stats.update(self.planner.stats_snapshot())
+        log.info("tick %s: 路线统计 %s", tick, self.route_stats)
+
     def _log_progress(self, tick: int, turn) -> None:
         cargos = sum(w.cargo for w in turn.workers)
         events_types = [e.event_type for e in turn.events[:6]]
