@@ -16,5 +16,9 @@
   "enable_chunk_sweep": true,
   "enemy_threat_penalty": 30,
   "hoard_mode": false,
-  "hoard_until_resources": 0
+  "hoard_until_resources": 0,
+  "hoard_min_population": 0,
+  "war_mode": false,
+  "war_reserve": 0,
+  "max_rangers": 0
 }

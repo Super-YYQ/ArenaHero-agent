@@ -9,6 +9,7 @@ from strategy import (
     StrategyState,
     WorkerTask,
     assign_resources,
+    decide_ranger,
     decide_worker,
     decide_vanguard,
     step_direction,
@@ -1491,6 +1492,7 @@ from arena_hero import CoreState, UnitType
 
 class _FakeCoreView:
     state = CoreState.NORMAL
+    hp = 5
 
 
 class _FakeCore:
@@ -1701,6 +1703,128 @@ def test_assign_resources_pauses_when_core_full():
     tasks3 = {}
     a3 = assign_resources(workers, [(2, 2)], set(), tasks3, tick=12)
     assert a3.get("w1") == (2, 2)
+
+
+# ---------- 建军出征与自动治疗 ----------
+
+def test_pick_raid_target_nearest():
+    """出征目标 = 记忆中最近的敌方 Core。"""
+    from strategy import pick_raid_target
+    enemy_cores = {(-50, 60): {"owner": "a"}, (-1383, 1644): {"owner": "b"},
+                   (-1400, 1660): {"owner": "c"}}
+    target = pick_raid_target(enemy_cores, (-1397, 1657))
+    assert target == (-1400, 1660), "应选最近的目标"
+
+
+def test_vanguard_raid_march():
+    """战争状态 + 出征目标:Vanguard 向目标行军(即使方向背离 Core)。"""
+    from pathfinding import HybridPathPlanner
+    p = HybridPathPlanner()
+    p.begin_tick(0)
+    v = {"id": "v1", "pos": (10, 0), "hp": 4, "hp_max": 4}
+    action, args = decide_vanguard(v, (0, 0), [], set(), {(10, 0)},
+                                   planner=p, raid_target=(40, 0), war_armed=True)
+    assert action == "move" and args[0] == "RIGHT", "应向出征目标行军"
+    # 已到相邻位:无敌可见时原地待命(下一 Tick 目标入视野即 SWEEP)
+    v2 = {"id": "v1", "pos": (39, 0), "hp": 4, "hp_max": 4}
+    action2, _ = decide_vanguard(v2, (0, 0), [], set(), {(39, 0)},
+                                 planner=p, raid_target=(40, 0), war_armed=True)
+    assert action2 == "wait"
+
+
+def test_vanguard_without_raid_still_guards():
+    """未出征(未武装/无目标)时保持守家行为。"""
+    v = {"id": "v1", "pos": (4, 0)}
+    action, args = decide_vanguard(v, (0, 0), [], set(), {(4, 0)}, war_armed=True)
+    assert action == "move" and args[0] == "LEFT"
+    action2, _ = decide_vanguard(v, (0, 0), [], set(), {(4, 0)}, war_armed=False)
+    assert action2 == "move" and args[0] == "LEFT"
+
+
+def test_ranger_shoots_enemy_core_in_range():
+    """射程内(直线 ≤3 格)的敌方 Core 是首选射击目标。"""
+    r = {"id": "r1", "pos": (0, 0), "hp": 2, "hp_max": 2}
+    enemies = [{"pos": (3, 0), "unit_type": None, "hp": 5}]
+    action, args = decide_ranger(r, (0, 0), enemies, set(), {(0, 0)})
+    assert action == "shoot" and args == (3, 0)
+
+
+def test_ranger_prefers_core_and_low_hp():
+    """同时有 Core 和 Unit 可射时优先 Core;同为 Unit 时优先低 HP。"""
+    r = {"id": "r1", "pos": (0, 0), "hp": 2, "hp_max": 2}
+    enemies = [
+        {"pos": (0, 2), "unit_type": "WORKER", "hp": 2},
+        {"pos": (0, 3), "unit_type": None, "hp": 5},
+    ]
+    action, args = decide_ranger(r, (0, 0), enemies, set(), {(0, 0)})
+    assert action == "shoot" and args == (0, 3), "围攻优先打 Core"
+    enemies2 = [{"pos": (2, 0), "unit_type": "WORKER", "hp": 2},
+                {"pos": (3, 0), "unit_type": "WORKER", "hp": 1}]
+    _, args2 = decide_ranger(r, (0, 0), enemies2, set(), {(0, 0)})
+    assert args2 == (3, 0), "Unit 优先打低 HP"
+
+
+def test_ranger_shoot_blocked_by_obstacle():
+    """射线被障碍挡住:不射击,转入行军/等待。"""
+    r = {"id": "r1", "pos": (0, 0), "hp": 2, "hp_max": 2}
+    enemies = [{"pos": (3, 0), "unit_type": None, "hp": 5}]
+    action, args = decide_ranger(r, (0, 0), enemies, {(1, 0)}, {(0, 0)},
+                                 raid_target=(6, 0), war_armed=True,
+                                 planner=None)
+    assert action != "shoot", "射线被挡不得射击"
+
+
+def test_worker_heals_at_core_when_damaged():
+    """带伤 Worker 回到 Core 格自动治疗(HEAL 完整动作,一次回满)。"""
+    from pathfinding import HybridPathPlanner
+    p = HybridPathPlanner()
+    p.begin_tick(0)
+    w = {"id": "w1", "pos": (0, 0), "cargo": 0, "hp": 1, "hp_max": 2}
+    action, _ = decide_worker(w, (0, 0), {}, set(), {(0, 0)}, set(), planner=p)
+    assert action == "heal"
+    # 满血不治疗
+    w2 = {"id": "w1", "pos": (0, 0), "cargo": 0, "hp": 2, "hp_max": 2}
+    action2, _ = decide_worker(w2, (0, 0), {}, set(), {(0, 0)}, set(), planner=p)
+    assert action2 != "heal"
+
+
+def test_worker_deposits_before_heal():
+    """满载优先交付,治疗让位。"""
+    from pathfinding import HybridPathPlanner
+    p = HybridPathPlanner()
+    p.begin_tick(0)
+    w = {"id": "w1", "pos": (0, 0), "cargo": 1, "hp": 1, "hp_max": 2}
+    action, _ = decide_worker(w, (0, 0), {}, set(), {(0, 0)}, set(), planner=p)
+    assert action == "deposit"
+
+
+def test_vanguard_heals_at_core_when_damaged():
+    """带伤 Vanguard 在 Core 格上治疗(而不是让位)。"""
+    v = {"id": "v1", "pos": (0, 0), "hp": 2, "hp_max": 4}
+    action, _ = decide_vanguard(v, (0, 0), [], set(), {(0, 0)})
+    assert action == "heal"
+
+
+def test_decide_core_war_gating():
+    """war_reserve:库存未达保留线不生产军备,达到后恢复。"""
+    ag = _hoard_agent({"war_mode": True, "war_reserve": 100,
+                       "max_workers": 19, "max_vanguards": 2})
+    core = _FakeCore()
+    ag._decide_core(_fake_turn(50), core, n_workers=19, n_vanguards=0, war_armed=False)
+    assert core.spawned == [], "未达保留线不建军"
+    ag._decide_core(_fake_turn(100), core, n_workers=19, n_vanguards=0, war_armed=True)
+    assert core.spawned == [UnitType.VANGUARD], "达标后建军"
+
+
+def test_war_armed_overrides_hoard():
+    """战争状态解除攒钱暂停:该买军备就买。"""
+    ag = _hoard_agent({"hoard_mode": True, "hoard_until_resources": 200,
+                       "hoard_min_population": 19, "max_workers": 19,
+                       "war_mode": True, "war_reserve": 50,
+                       "max_vanguards": 2})
+    core = _FakeCore()
+    ag._decide_core(_fake_turn(60), core, n_workers=19, n_vanguards=0, war_armed=True)
+    assert core.spawned == [UnitType.VANGUARD], "战争状态优先于攒钱暂停"
 
 
 def load_tests(loader, tests, pattern):

@@ -121,6 +121,63 @@ SWEEP_POINT_X_OFFSETS = (2, 8, 14, 20, 29)  # 首点 ≤3、末点 ≥28，行�
 SWEEP_MIN_CHUNK_GAP = 2           # 活跃区块最小切比雪夫距离：防止多 Worker 挤在同一片
 SWEEP_STARVE_TICKS = 1500         # 区块超过该 Tick 未扫则插队，防止远处区块饿死
 ENEMY_CORE_ZONE_RADIUS = 4        # 敌方基地的路线规避圈（驻军防御范围）
+RANGER_SHOOT_RANGE = 3            # Ranger 射程：横/竖/45°斜线 1~3 格
+UNIT_HP_MAX = {"WORKER": 2, "VANGUARD": 4, "RANGER": 2}
+
+
+def pick_raid_target(
+    enemy_cores: dict,
+    core_pos: tuple[int, int],
+    exclude: frozenset = frozenset(),
+) -> tuple[int, int] | None:
+    """选最近的敌方 Core 作为出征目标（确定性 tie-break）。"""
+    best = None
+    for cell in enemy_cores:
+        if cell in exclude:
+            continue
+        d = abs(cell[0] - core_pos[0]) + abs(cell[1] - core_pos[1])
+        key = (d, cell[1], cell[0])
+        if best is None or key < best[0]:
+            best = (key, cell)
+    return best[1] if best else None
+
+
+def ranger_shoot_cell(
+    pos: tuple[int, int],
+    enemies: list[dict],
+    obstacles: set[tuple[int, int]],
+) -> tuple[int, int] | None:
+    """Ranger 的最佳射击格：横/竖/45°斜线 1~3 格、中间无障碍。
+
+    优先敌方 Core（围攻优先），其次 HP 最低的敌方 Unit；平局取最近。
+    服务端按格结算：命中该格 HP 最低的敌方对象。
+    """
+    best = None
+    for e in enemies:
+        ex, ey = e["pos"]
+        dx, dy = ex - pos[0], ey - pos[1]
+        if dx != 0 and dy != 0 and abs(dx) != abs(dy):
+            continue  # 不在横/竖/45°斜线上
+        dist = max(abs(dx), abs(dy))
+        if dist < 1 or dist > RANGER_SHOOT_RANGE:
+            continue
+        sx = (dx > 0) - (dx < 0)
+        sy = (dy > 0) - (dy < 0)
+        blocked = False
+        for s in range(1, dist):
+            if (pos[0] + sx * s, pos[1] + sy * s) in obstacles:
+                blocked = True
+                break
+        if blocked:
+            continue
+        is_core = e.get("unit_type") is None
+        hp = e.get("hp")
+        key = (0 if is_core else 1,
+               hp if hp is not None else 99,
+               dist, ey, ex)
+        if best is None or key < best[0]:
+            best = (key, (ex, ey))
+    return best[1] if best else None
 
 
 def enemy_threat_cells(
@@ -740,6 +797,12 @@ def decide_worker(
                                   allow_goal_occupied=not core_cell_reserved,
                                   threat=threat, goal_kind="core")
             return move_or_wait(r)
+        # 自动治疗：在自己 Core 格上带伤时优先恢复（HEAL 完整动作，一次可回满；
+        # 资源不足时服务端私下失败不扣资源，下一 Tick 重试）
+        if pos == core_pos:
+            hp, hp_max = worker.get("hp"), worker.get("hp_max")
+            if hp is not None and hp_max and hp < hp_max:
+                return ("heal", ())
         target = assignment.get(wid)
         if target is None:
             # 侦察：航点作为普通路线目标交给规划器；BLOCKED 由探索前沿兜底
@@ -823,12 +886,18 @@ def decide_vanguard(
     enemies: list[dict],
     obstacles: set[tuple[int, int]],
     occupied: set[tuple[int, int]],
+    planner=None,
+    raid_target: tuple[int, int] | None = None,
+    war_armed: bool = False,
+    threat_zones: set[tuple[int, int]] | None = None,
 ) -> tuple[str, tuple]:
-    """Vanguard 自卫：有敌近身先打，否则守在 Core 旁。
+    """Vanguard 自卫与出征：有敌近身先打；战争状态下向目标 Core 行军围攻；
+    否则守在 Core 旁相邻空位（绝不蹲交付口）。
 
-    enemies: [{'id','pos','unit_type'}] 当前可见敌方对象。
+    enemies: [{'id','pos','unit_type'}] 当前可见敌方对象（含敌方 Core）。
     SWEEP 不需要目标 UUID，也绝不会伤到自己人，直接朝敌方所在相邻格打。
-    Vanguard 绝不蹲在 Core 格上——那格是唯一的交付口，蹲上去会堵死全队。
+    raid_target/war_armed 由 agent 在战争开启且库存达保留线时传入；
+    planner 用于跨区长途行军（贪心单步会卡死在障碍上）。
     """
     pos = vanguard["pos"]
     adjacent_enemies = [
@@ -842,11 +911,33 @@ def decide_vanguard(
         return ("sweep", (direction,))
 
     dist_core = abs(pos[0] - core_pos[0]) + abs(pos[1] - core_pos[1])
-    # 出生/滞留在 Core 格上：立刻让出交付口，挪到相邻空位
+    # 出生/滞留在 Core 格上：带伤先治疗（HEAL 完整动作、一次可回满），否则让出交付口
     if dist_core == 0:
+        hp, hp_max = vanguard.get("hp"), vanguard.get("hp_max")
+        if hp is not None and hp_max and hp < hp_max:
+            return ("heal", ())
         for d, nxt in neighbors(pos):
             if nxt not in obstacles and nxt not in occupied:
                 return ("move", (d,))
+        return ("wait", ())
+
+    # 出征：战争状态下向目标 Core 行军；到达相邻位后上面的
+    # adjacent_enemies 分支自动 SWEEP 围攻（相邻 1 格 = SWEEP 射程）
+    if war_armed and raid_target is not None:
+        if abs(pos[0] - raid_target[0]) + abs(pos[1] - raid_target[1]) > 1:
+            if planner is not None:
+                r = planner.next_step(
+                    vanguard["id"], pos, raid_target, obstacles=obstacles,
+                    occupied=occupied, threat=frozenset(threat_zones or ()),
+                    goal_kind="scout",
+                )
+                if r.steps:
+                    return ("move", (r.steps[0],))
+                return ("wait", ())
+            d = step_direction(pos, raid_target, obstacles, occupied)
+            if d:
+                return ("move", (d,))
+            return ("wait", ())
         return ("wait", ())
 
     # 敌人接近 Core（视野内距 Core <= 2）：迎击
@@ -858,6 +949,62 @@ def decide_vanguard(
                 return ("move", (d,))
 
     # 平时蹲守：回到 Core 相邻的空位（不占 Core 格）
+    if dist_core > 1:
+        d = step_direction(pos, core_pos, obstacles, occupied)
+        if d:
+            return ("move", (d,))
+    return ("wait", ())
+
+
+def decide_ranger(
+    ranger: dict,
+    core_pos: tuple[int, int],
+    enemies: list[dict],
+    obstacles: set[tuple[int, int]],
+    occupied: set[tuple[int, int]],
+    planner=None,
+    raid_target: tuple[int, int] | None = None,
+    war_armed: bool = False,
+    threat_zones: set[tuple[int, int]] | None = None,
+) -> tuple[str, tuple]:
+    """Ranger：射程（横/竖/斜 1~3 格）内见敌就射（优先敌方 Core）；
+    战争状态随队出征，行进到目标相邻位开火；否则回 Core 旁待命。"""
+    pos = ranger["pos"]
+    # 1) 射程内最优目标
+    cell = ranger_shoot_cell(pos, enemies, obstacles)
+    if cell is not None:
+        return ("shoot", (cell[0], cell[1]))
+
+    dist_core = abs(pos[0] - core_pos[0]) + abs(pos[1] - core_pos[1])
+    # 2) Core 格上：带伤治疗，否则让位
+    if dist_core == 0:
+        hp, hp_max = ranger.get("hp"), ranger.get("hp_max")
+        if hp is not None and hp_max and hp < hp_max:
+            return ("heal", ())
+        for d, nxt in neighbors(pos):
+            if nxt not in obstacles and nxt not in occupied:
+                return ("move", (d,))
+        return ("wait", ())
+
+    # 3) 出征：行军到目标相邻位（相邻必在射程内,停下开火）
+    if war_armed and raid_target is not None:
+        if abs(pos[0] - raid_target[0]) + abs(pos[1] - raid_target[1]) > 1:
+            if planner is not None:
+                r = planner.next_step(
+                    ranger["id"], pos, raid_target, obstacles=obstacles,
+                    occupied=occupied, threat=frozenset(threat_zones or ()),
+                    goal_kind="scout",
+                )
+                if r.steps:
+                    return ("move", (r.steps[0],))
+                return ("wait", ())
+            d = step_direction(pos, raid_target, obstacles, occupied)
+            if d:
+                return ("move", (d,))
+            return ("wait", ())
+        return ("wait", ())
+
+    # 4) 平时蹲守：回到 Core 相邻的空位
     if dist_core > 1:
         d = step_direction(pos, core_pos, obstacles, occupied)
         if d:

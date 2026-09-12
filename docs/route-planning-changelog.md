@@ -39,6 +39,36 @@
   情报日志(Beacon 坐标全服公开)。
 - 尚未实现:主动进攻、Beacon 夺取、Core 迁移朝原点搬家——等经济有余力再评估。
 
+## 追加:战争系统——建军、出征、自动治疗(2026-09-13)
+
+新增配置:`war_mode`(默认 false 总开关)、`war_reserve`(默认 0,库存保留线:
+低于它不买军备不出征,继续攒钱)、`max_rangers`(默认 0,Ranger 生产上限)。
+
+- `pick_raid_target()`:从 `enemy_cores` 记忆中选最近的敌方 Core 作为出征目标;
+  目标被摧毁(视野校正清除)后自动轮换到下一个。
+- `decide_vanguard`:战争状态下留 1 个守家(id 最小),其余向目标行军(规划器
+  跨区长途),到达相邻位自动 SWEEP 围攻(含敌方 Core,1 伤害/Tick 集火)。
+- `decide_ranger`(新单位):横/竖/45°斜线 1~3 格无遮挡即开火
+  (`ranger_shoot_cell` 优先敌方 Core、其次低 HP);射程外随队行军。
+- 自动治疗:单位带伤回到自己 Core 格上自动 HEAL(1 资源/HP,一次回满),
+  交付优先于治疗;Core 受创时自疗优先于生产。
+- 生产:`_decide_core` 增加 Ranger 分支;`war_mode` 下军备只在库存达
+  `war_reserve` 后生产,战争状态解除攒钱暂停(hoard 让位)。
+- 军费参考(人口 20~24 档):Vanguard 13、Ranger 16;无维护费,
+  持续成本只有战损补员。
+
+## 满仓死锁修复(2026-09-13 凌晨)
+
+- **Core 格串行申报**:多个满载 Worker 同 Tick 申报进入 Core 格会被服务端
+  依赖图整批拒绝 → 35 分钟零交付。修复:每 Tick 只允许一个 Worker 申报,
+  其余在旁排队;新旧路径都修;队列消化测试覆盖。
+- **Vanguard 蹲交付口**:Vanguard 出生在 Core 格上且 `dist ≤ 1` 即 wait,
+  永久堵死交付(与 17:47:56 的 Vanguard 生产、17:47:40 起的交付停摆完全
+  吻合)。修复:dist 0 立刻让位到相邻空位;补上 Vanguard 决策日志。
+- **满仓暂停采集**:`assign_resources(core_space=...)` 满仓时清空采集任务,
+  Worker 转入扫掠待命;支出腾出空间后自动复工。
+- 处理了双 agent 进程并跑的问题(同账号双计划槽冲突)。
+
 ## 追加:攒钱模式与生产保留金(2026-09-12 傍晚)
 
 - `hoard_mode`(默认 false):暂停一切 Unit 生产;配合 `hoard_until_resources`
