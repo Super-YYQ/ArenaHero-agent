@@ -13,5 +13,6 @@
   "fast_path_distance": 12,
   "unknown_cell_penalty": 1,
   "enable_chunk_navigation": true,
-  "enable_chunk_sweep": true
+  "enable_chunk_sweep": true,
+  "enemy_threat_penalty": 30
 }

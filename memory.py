@@ -30,6 +30,9 @@ class MapMemory:
         self.core_position: tuple[int, int] | None = None
         # 障碍版本号：新增永久障碍时单调递增，用于路线缓存失效
         self.obstacle_revision = 0
+        # 已知敌方 Core：cell -> {"owner": str|None, "tick": 最后确认 tick}
+        # Core 迁移极慢(4 Tick 一格)，记录长期有效；视野校正负责清除搬迁旧位
+        self.enemy_cores: dict[tuple[int, int], dict] = {}
         # 区块导航摘要（不作为可信执行计划；重连后只恢复静态摘要）
         self.chunk_index = ChunkNavigationIndex()
         self._dirty = False
@@ -80,6 +83,20 @@ class MapMemory:
                 self.chunk_index.from_dict(nav)
             except Exception:
                 self.chunk_index = ChunkNavigationIndex()
+        # 敌方 Core 记忆独立解析：坏条目只丢该条
+        raw_enemies = data.get("enemy_cores")
+        if isinstance(raw_enemies, dict):
+            for key, raw in raw_enemies.items():
+                try:
+                    xs, ys = str(key).split(",")
+                    cell = (int(xs), int(ys))
+                    if isinstance(raw, dict):
+                        self.enemy_cores[cell] = {
+                            "owner": raw.get("owner"),
+                            "tick": int(raw.get("tick", 0) or 0),
+                        }
+                except (ValueError, TypeError):
+                    continue
 
     def maybe_save(self, interval: float = 30.0) -> None:
         now = time.monotonic()
@@ -95,6 +112,10 @@ class MapMemory:
             "core_position": list(self.core_position) if self.core_position else None,
             "obstacle_revision": self.obstacle_revision,
             "chunk_navigation": self.chunk_index.to_dict(),
+            "enemy_cores": {
+                f"{k[0]},{k[1]}": {"owner": v.get("owner"), "tick": v.get("tick", 0)}
+                for k, v in self.enemy_cores.items()
+            },
         }
         tmp = self.path.with_suffix(".tmp")
         tmp.write_text(json.dumps(data), encoding="utf-8")
@@ -139,6 +160,35 @@ class MapMemory:
                 if cell in vis and cell not in res:
                     del self.resource_seen[cell]
                     self._dirty = True
+
+    # ---------- 敌方感知 ----------
+    def observe_enemies(self, tick: int, enemy_cores, visible_cells=None) -> int:
+        """合并视野内的敌方 Core 记忆。返回新发现的基地数。
+
+        enemy_cores: [(cell, owner_username|None)]，来自本 Tick 可见敌方 Core。
+        visible_cells 用于校正：原记录位置已在视野内却没有敌方 Core（迁走了）→ 删除。
+        """
+        known = 0
+        seen = set()
+        for pos, owner in enemy_cores:
+            pos = tuple(pos)
+            seen.add(pos)
+            cur = self.enemy_cores.get(pos)
+            if cur is None:
+                self.enemy_cores[pos] = {"owner": owner, "tick": tick}
+                self._dirty = True
+                known += 1
+            elif cur.get("owner") != owner or cur.get("tick") != tick:
+                self.enemy_cores[pos] = {"owner": owner, "tick": tick}
+                self._dirty = True
+        if visible_cells:
+            vis = {tuple(c) for c in visible_cells}
+            for cell in list(self.enemy_cores):
+                if cell in vis and cell not in seen:
+                    # 视野确认原位置已无敌方 Core（Core 迁走了）
+                    del self.enemy_cores[cell]
+                    self._dirty = True
+        return known
 
     # ---------- 查询 ----------
     def known_resources(self, tick: int, max_age: int = 64) -> list[tuple[int, int]]:

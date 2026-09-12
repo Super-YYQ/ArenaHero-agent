@@ -119,6 +119,58 @@ SWEEP_CHUNK_RADIUS = 2            # Core 周边 5×5 个区块纳入扫掠
 SWEEP_LINE_OFFSETS = (3, 10, 17, 24, 31)   # 行距 7：视野 ±3 无缝覆盖 32 行
 SWEEP_POINT_X_OFFSETS = (2, 8, 14, 20, 29)  # 首点 ≤3、末点 ≥28，行走沿线全覆盖
 SWEEP_MIN_CHUNK_GAP = 2           # 活跃区块最小切比雪夫距离：防止多 Worker 挤在同一片
+ENEMY_CORE_ZONE_RADIUS = 4        # 敌方基地的路线规避圈（驻军防御范围）
+
+
+def enemy_threat_cells(
+    enemies: list[dict],
+    obstacles: set[tuple[int, int]],
+) -> tuple[set, set]:
+    """按单位类型计算威胁格。
+
+    返回 (threat_cells, zones)：
+    - threat_cells：能打到你的格子，Worker 站上去就触发撤退。
+      Vanguard / 敌方 Core 相邻 1 格；Ranger 八方向直线 1~3 格（障碍挡射线）；
+      敌方 Worker 完全不能攻击，不构成威胁。
+    - zones：路线惩罚圈 = 上面全部 + 敌方 Core 周边 ENEMY_CORE_ZONE_RADIUS 格。
+      传给规划器的 threat_penalty，让路线绕开敌方基地而不是硬穿。
+    """
+    threat: set[tuple[int, int]] = set()
+    zones: set[tuple[int, int]] = set()
+
+    def add(cell: tuple[int, int]) -> None:
+        threat.add(cell)
+        zones.add(cell)
+
+    for e in enemies:
+        x, y = e["pos"]
+        ut = e.get("unit_type")
+        name = getattr(ut, "name", ut)
+        if name is None:
+            # 敌方 Core：本体会被 Vanguard SWEEP 打到
+            add((x, y))
+            for dx, dy in DELTA.values():
+                add((x + dx, y + dy))
+            r = ENEMY_CORE_ZONE_RADIUS
+            for dx in range(-r, r + 1):
+                for dy in range(-r, r + 1):
+                    if abs(dx) + abs(dy) <= r:
+                        zones.add((x + dx, y + dy))
+        elif name == "RANGER":
+            add((x, y))
+            for ddx, ddy in ((1, 0), (0, 1), (1, 1), (1, -1)):
+                for sign in (1, -1):
+                    for s in (1, 2, 3):
+                        cell = (x + ddx * s * sign, y + ddy * s * sign)
+                        if cell in obstacles:
+                            break
+                        add(cell)
+        elif name == "VANGUARD":
+            add((x, y))
+            for dx, dy in DELTA.values():
+                add((x + dx, y + dy))
+        # WORKER：完全不能攻击，不构成威胁
+    return threat, zones
 
 
 def chunk_sweep_points(chunk: tuple[int, int]) -> list[tuple[int, int]]:
@@ -345,14 +397,17 @@ def assign_explore_targets(
     tick: int,
     obstacles: set[tuple[int, int]] | None = None,
     sweep: bool = True,
+    avoid_zones: set[tuple[int, int]] | None = None,
 ) -> None:
     """给没有资源任务的空载 Worker 分配侦察目标。原地改 workers 与 state。
 
     sweep=True 走"近场逐区块扫掠"：扫描线把 Core 周边 5×5 区块全覆盖，
     到期复查的资源区块优先——配额制世界里这是发现资源点的主要手段。
     sweep=False 保留旧的稀疏环形航点行为（回归兼容/fallback）。
+    avoid_zones（如敌方基地圈）里的格子不当目标、扫掠时直接跳过。
     """
     obstacles = obstacles or set()
+    zones = avoid_zones or set()
 
     def reset_progress(wid: str) -> None:
         state.stall_count[wid] = 0
@@ -410,7 +465,7 @@ def assign_explore_targets(
         def advance(ch: tuple[int, int]) -> tuple[int, int] | None:
             points = chunk_sweep_points(ch)
             idx = state.sweep_cursor.get(ch, 0)
-            while idx < len(points) and points[idx] in obstacles:
+            while idx < len(points) and (points[idx] in obstacles or points[idx] in zones):
                 idx += 1
             if idx >= len(points):
                 # 本轮扫完：记录完成时间、游标归零，等待下一轮轮转
@@ -464,7 +519,7 @@ def assign_explore_targets(
             if point is not None:
                 return point
         else:
-            blocked = obstacles | avoid | state.scout_claims
+            blocked = obstacles | zones | avoid | state.scout_claims
             due = due_refill_chunks()
             due.sort(key=lambda ch: _manhattan(core_pos, state.chunk_anchor.get(ch, chunk_center(ch))))
             for ch in due:
@@ -479,7 +534,7 @@ def assign_explore_targets(
             state.scout_claims,
             state.scout_slots[wid],
             tick,
-            avoid=avoid,
+            avoid=avoid | zones,
             obstacles=obstacles,
             waypoint_last_seen=state.waypoint_last_seen,
         )
@@ -626,16 +681,20 @@ def decide_worker(
     occupied: set[tuple[int, int]],
     threat_cells: set[tuple[int, int]],
     planner=None,
+    threat_zones: set[tuple[int, int]] | None = None,
 ) -> tuple[str, tuple]:
     """返回 (action, args)，action ∈ {'harvest','deposit','move','wait'}。
 
     优先级：受威胁撤退 > 满载回 Core > 到位采集 > 按任务移动。
     planner 非空时，撤退/回 Core/去资源/侦察四类移动统一交给混合规划器；
     planner 为 None 时保持旧的单步贪心行为（回归兼容，含侦察 away 兜底）。
+    threat_cells 是能打到自己的格子（撤退触发）；threat_zones 是更大的路线
+    惩罚圈（如敌方基地周边），传给规划器的 threat_penalty 绕开硬穿。
     """
     pos = worker["pos"]
     last_pos = worker.get("last_pos")
     forbidden = {last_pos} if last_pos else set()
+    route_threat = threat_zones if threat_zones is not None else threat_cells
 
     def move_or_wait(result) -> tuple[str, tuple]:
         if result.steps:
@@ -644,11 +703,12 @@ def decide_worker(
 
     if planner is not None:
         wid = worker["id"]
+        threat = frozenset(route_threat)
         # 遭遇敌人：向 Core 撤退（Worker 完全不能攻击）
         if pos in threat_cells:
             r = planner.next_step(wid, pos, core_pos, obstacles=obstacles, occupied=occupied,
                                   forbidden=forbidden, allow_goal_occupied=True,
-                                  threat=threat_cells, goal_kind="core")
+                                  threat=threat, goal_kind="core")
             return move_or_wait(r)
         if worker["cargo"] > 0:
             if pos == core_pos:
@@ -656,7 +716,7 @@ def decide_worker(
             # Core 格是占位实体，交付时必须走进去：allow_goal_occupied=True
             r = planner.next_step(wid, pos, core_pos, obstacles=obstacles, occupied=occupied,
                                   forbidden=forbidden, allow_goal_occupied=True,
-                                  goal_kind="core")
+                                  threat=threat, goal_kind="core")
             return move_or_wait(r)
         target = assignment.get(wid)
         if target is None:
@@ -666,7 +726,7 @@ def decide_worker(
                 # 到点停下，下一 Tick 由 assign_explore_targets 换目标
                 return ("wait", ())
             r = planner.next_step(wid, pos, explore, obstacles=obstacles, occupied=occupied,
-                                  forbidden=forbidden, goal_kind="scout")
+                                  forbidden=forbidden, threat=threat, goal_kind="scout")
             return move_or_wait(r)
         if pos == target:
             # 只有当前视野确认该格仍有资源才 harvest，否则原地等重新分配
@@ -675,7 +735,7 @@ def decide_worker(
                 return ("harvest", ())
             return ("wait", ())
         r = planner.next_step(wid, pos, target, obstacles=obstacles, occupied=occupied,
-                              forbidden=forbidden, goal_kind="harvest")
+                              forbidden=forbidden, threat=threat, goal_kind="harvest")
         return move_or_wait(r)
 
     # 遭遇敌人：向 Core 撤退（Worker 完全不能攻击）

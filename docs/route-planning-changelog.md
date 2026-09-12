@@ -24,6 +24,21 @@
 相比此前 3 天 24 次采集是数量级提升。朝原点方向(ring 更低、配额更高)的
 远期扩张待经济转正后另行规划。
 
+## 追加:敌方感知与规避(2026-09-12 傍晚)
+
+视野内出现其他玩家的基地/单位后,此前只有"相邻格撤退 + Vanguard 自卫"。
+本次新增(`enemy_threat_penalty`,默认 30):
+
+- `enemy_threat_cells()`:按单位类型分级——敌方 Vanguard/Core 相邻 1 格、
+  Ranger 八方向直线 1~3 格(障碍挡射线)是攻击威胁(Worker 站上去即触发撤退);
+  敌方 Worker 完全不能攻击,不构成威胁;敌方 Core 周边半径 4 格是路线规避圈,
+  以 threat_penalty 传给规划器,路线绕开敌方基地而非硬穿。
+- `MapMemory.enemy_cores`:视野内敌方 Core 记入长期记忆(owner + 最后确认
+  tick),持久化到 memory.json 并随重连恢复;Core 迁走后由视野校正清除。
+- 扫掠停留点/复查点/航点选择都会跳过敌方规避圈;`turn.beacon` 落地时记录
+  情报日志(Beacon 坐标全服公开)。
+- 尚未实现:主动进攻、Beacon 夺取、Core 迁移朝原点搬家——等经济有余力再评估。
+
 ## 移动调用点清单(Phase 0 记录)
 
 ### strategy.py

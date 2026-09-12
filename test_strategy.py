@@ -1237,7 +1237,7 @@ def test_worker_exception_does_not_block_others():
         wd2 = {"id": "w2", "pos": (0, 1), "cargo": 0}
         ag._run_workers(types.SimpleNamespace(workers=[w1, w2]),
                         [wd1, wd2], (0, 0), {"w2": (2, 1)}, set(),
-                        {(0, 0), (0, 1)}, set(), 1)
+                        {(0, 0), (0, 1)}, set(), set(), 1)
     finally:
         agent_mod.decide_worker = real
     assert w1.calls == [("wait", None)], "异常 Worker 应回退 wait"
@@ -1389,6 +1389,101 @@ def test_sweep_harvest_duty_releases_chunk():
     assign_explore_targets([w1], {"w1": (9, 9)}, (0, 0), state, 2)
     assert "w1" not in state.sweep_assign
     assert "w1" not in state.explore_targets
+
+
+# ---------- 敌方感知与规避 ----------
+
+def test_enemy_threat_cells_by_type():
+    """Ranger 直线 3 格、Vanguard 相邻、敌方 Worker 无威胁、Core 有规避圈。"""
+    from strategy import enemy_threat_cells
+    enemies = [
+        {"pos": (0, 0), "unit_type": "RANGER"},
+        {"pos": (20, 0), "unit_type": "VANGUARD"},
+        {"pos": (40, 0), "unit_type": "WORKER"},
+        {"pos": (60, 0), "unit_type": None},
+    ]
+    threat, zones = enemy_threat_cells(enemies, set())
+    # Ranger:同行 1..3 格都在射程(含负方向与斜线)
+    assert (1, 0) in threat and (3, 0) in threat and (-3, 0) in threat
+    assert (2, 2) in threat and (0, -3) in threat
+    assert (4, 0) not in threat, "Ranger 射程只有 3 格"
+    # Vanguard:相邻 1 格
+    assert (21, 0) in threat and (20, 1) in threat and (22, 0) not in threat
+    # 敌方 Worker 不能攻击:不产生威胁
+    assert (41, 0) not in threat and (40, 0) not in threat
+    # 敌方 Core:相邻 1 格是攻击威胁,周边 4 格只是路线规避圈
+    assert (61, 0) in threat
+    assert (60, 4) not in threat, "Core 规避圈不是攻击威胁"
+    assert (60, 4) in zones and (64, 0) in zones and (65, 0) not in zones
+
+
+def test_enemy_ranger_line_blocked_by_obstacle():
+    """Ranger 射线被障碍挡住:障碍之后的格子不再是威胁。"""
+    from strategy import enemy_threat_cells
+    threat, _ = enemy_threat_cells([{"pos": (0, 0), "unit_type": "RANGER"}],
+                                   {(2, 0)})
+    assert (1, 0) in threat
+    assert (2, 0) not in threat and (3, 0) not in threat
+    # 另一侧没被挡,仍然在射程内
+    assert (-3, 0) in threat
+
+
+def test_worker_flees_ranger_line():
+    """Worker 站在 Ranger 射线上(相距 2 格)也触发撤退。"""
+    from pathfinding import HybridPathPlanner
+    from strategy import enemy_threat_cells
+    threat, zones = enemy_threat_cells([{"pos": (0, 0), "unit_type": "RANGER"}], set())
+    p = HybridPathPlanner()
+    p.begin_tick(0)
+    w = {"id": "w1", "pos": (-2, 0), "cargo": 0}
+    action, args = decide_worker(w, (-5, 0), {}, set(), {(-2, 0)}, threat,
+                                 planner=p, threat_zones=zones)
+    assert action == "move"
+    assert args[0] == "LEFT", "应向远离 Ranger 的方向撤退"
+
+
+def test_worker_not_threatened_by_enemy_worker():
+    """敌方 Worker 不能攻击:相邻也不触发撤退。"""
+    w = {"id": "w1", "pos": (0, 0), "cargo": 0, "visible_resources": {(3, 0)}}
+    legacy = decide_worker(w, (0, 0), {"w1": (3, 0)}, set(), set(), set())
+    assert legacy == ("move", ("RIGHT",))
+
+
+def test_sweep_skips_enemy_zone_points():
+    """敌方基地规避圈内的扫描点被跳过,不当目标。"""
+    from strategy import StrategyState, assign_explore_targets
+    state = StrategyState()
+    enemy_zone = {(2, 3), (8, 3)}  # chunk (0,0) 的前两个扫描点
+    workers = [{"id": "w1", "pos": (0, 0), "cargo": 0}]
+    assign_explore_targets(workers, {}, (0, 0), state, 1, avoid_zones=enemy_zone)
+    assert workers[0]["explore_target"] == (14, 3)
+    assert state.sweep_cursor[(0, 0)] == 3
+
+
+def test_memory_enemy_cores_persist_and_correct():
+    """敌方 Core 记忆持久化往返;搬迁旧位由视野校正清除。"""
+    import json
+    import tempfile
+
+    from memory import MapMemory
+    tmp = Path(tempfile.mkdtemp()) / "m.json"
+    mem = MapMemory(tmp)
+    known = mem.observe_enemies(10, [((-50, 60), "RivalPlayer")], visible_cells={(-50, 60)})
+    assert known == 1
+    # 重复确认不新增
+    assert mem.observe_enemies(11, [((-50, 60), "RivalPlayer")]) == 0
+    # 迁走:原位置可见但已无敌 Core → 清除
+    mem.observe_enemies(12, [], visible_cells={(-50, 60)})
+    assert (-50, 60) not in mem.enemy_cores
+    # 持久化往返
+    mem.observe_enemies(13, [((-40, 70), "RivalPlayer")])
+    mem.save()
+    mem2 = MapMemory(tmp)
+    assert mem2.enemy_cores[(-40, 70)]["owner"] == "RivalPlayer"
+    # 旧 schema(无 enemy_cores 字段)可加载
+    old = {"obstacles": [[1, 1]], "resources": {}}
+    tmp.write_text(json.dumps(old), encoding="utf-8")
+    assert MapMemory(tmp).enemy_cores == {}
 
 
 def load_tests(loader, tests, pattern):

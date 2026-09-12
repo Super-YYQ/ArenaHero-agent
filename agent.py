@@ -17,6 +17,7 @@ from memory import MapMemory
 from pathfinding import HybridPathPlanner
 from strategy import (
     DELTA,
+    ENEMY_CORE_ZONE_RADIUS,
     RESOURCE_COOLDOWN_TICKS,
     RESOURCE_MEMORY_TTL,
     VISION,
@@ -26,6 +27,7 @@ from strategy import (
     chunk_of,
     decide_vanguard,
     decide_worker,
+    enemy_threat_cells,
     refill_tick_at_or_after,
     visible_from,
 )
@@ -45,6 +47,7 @@ PLANNER_DEFAULTS = {
     "unknown_cell_penalty": 1,
     "enable_chunk_navigation": True,
     "enable_chunk_sweep": True,
+    "enemy_threat_penalty": 30,
 }
 # 数值型配置的合理上限，超出视为非法
 PLANNER_INT_LIMITS = {
@@ -54,6 +57,7 @@ PLANNER_INT_LIMITS = {
     "route_cache_size": 65_536,
     "fast_path_distance": 64,
     "unknown_cell_penalty": 100,
+    "enemy_threat_penalty": 1_000,
 }
 
 
@@ -131,6 +135,7 @@ class Agent:
                 total_path_budget=pcfg["total_path_budget"],
                 fast_path_distance=pcfg["fast_path_distance"],
                 unknown_penalty=pcfg["unknown_cell_penalty"],
+                threat_penalty=pcfg["enemy_threat_penalty"],
                 routes=self.strat.routes,
                 cache=self.strat.route_cache,
                 chunk_index=self.mem.chunk_index if use_chunks else None,
@@ -228,7 +233,9 @@ class Agent:
             for v in turn.vanguards
         ]
         enemies = [
-            {"id": str(e.id), "pos": (e.position[0], e.position[1]), "unit_type": getattr(e, "unit_type", None)}
+            {"id": str(e.id), "pos": (e.position[0], e.position[1]),
+             "unit_type": getattr(e, "unit_type", None),
+             "owner": getattr(e, "owner_username", None)}
             for e in turn.visible_enemies
         ]
         obstacles = set(self.mem.obstacles)
@@ -243,13 +250,28 @@ class Agent:
         if core is None:
             return
 
-        # 敌人所在格及邻格视为威胁
-        threat_cells = set()
-        for e in enemies:
-            x, y = e["pos"]
-            threat_cells.add((x, y))
-            for dx, dy in DELTA.values():
-                threat_cells.add((x + dx, y + dy))
+        # ---- 敌方感知：按类型分级威胁 + 基地记忆 ----
+        threat_cells, enemy_zones = enemy_threat_cells(enemies, obstacles)
+        # 记忆中的敌方 Core（含历史视野）也纳入路线规避圈
+        for cell in self.mem.enemy_cores:
+            x, y = cell
+            r = ENEMY_CORE_ZONE_RADIUS
+            for dx in range(-r, r + 1):
+                for dy in range(-r, r + 1):
+                    if abs(dx) + abs(dy) <= r:
+                        enemy_zones.add((x + dx, y + dy))
+        # 视野内敌方 Core 记入长期记忆；搬迁旧位由视野校正清除
+        enemy_core_obs = [(e["pos"], e.get("owner")) for e in enemies if e["unit_type"] is None]
+        new_bases = self.mem.observe_enemies(tick, enemy_core_obs, visible_cells=visible_cells)
+        if new_bases:
+            log.info("tick %s: 发现 %s 个敌方基地：%s", tick, new_bases,
+                     [(pos, owner) for pos, owner in enemy_core_obs])
+        beacon = getattr(turn, "beacon", None)
+        if beacon is not None:
+            status = getattr(beacon, "status", None)
+            if getattr(status, "name", status) == "GROUND":
+                log.info("tick %s: Champion Beacon 落地于 %s（坐标全服公开）",
+                         tick, tuple(beacon.position))
 
         # ---- 资源分配 ----
         resource_cells = [tuple(c) for c in turn.resource_cells]
@@ -272,14 +294,15 @@ class Agent:
 
         # 没有资源任务的 Worker：近场逐区块扫掠（发现资源点的主要手段），
         # 卡住 SCOUT_STALL_TICKS 或到达停留点 → 前进到下一个扫描点。
+        # 敌方基地圈内的格子不当目标。
         assign_explore_targets(
             workers, assignment, core_pos, self.strat, tick, obstacles=obstacles,
-            sweep=self.pcfg["enable_chunk_sweep"],
+            sweep=self.pcfg["enable_chunk_sweep"], avoid_zones=enemy_zones,
         )
 
         # ---- Worker 行动（单 Worker 异常隔离，绝不阻塞整 Tick 提交）----
         self._run_workers(turn, workers, core_pos, assignment, obstacles, occupied,
-                          threat_cells, tick)
+                          threat_cells, enemy_zones, tick)
 
         # ---- Vanguard 行动 ----
         for v, vdict in zip(turn.vanguards, vanguards):
@@ -302,13 +325,13 @@ class Agent:
 
     # ---------- 指令翻译 ----------
     def _run_workers(self, turn, workers, core_pos, assignment, obstacles, occupied,
-                     threat_cells, tick) -> None:
+                     threat_cells, enemy_zones, tick) -> None:
         """逐 Worker 决策与执行；单个 Worker 的异常只影响自己（wait），不阻塞提交。"""
         for w, wdict in zip(turn.workers, workers):
             try:
                 action, args = decide_worker(
                     wdict, core_pos, assignment, obstacles, occupied, threat_cells,
-                    planner=self.planner,
+                    planner=self.planner, threat_zones=enemy_zones,
                 )
                 log.info(
                     "tick %s: worker %s @%s cargo=%s -> %s %s (target=%s explore=%s)",
