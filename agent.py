@@ -317,6 +317,8 @@ class Agent:
         for v, vdict in zip(turn.vanguards, vanguards):
             try:
                 action, args = decide_vanguard(vdict, core_pos, enemies, obstacles, occupied)
+                log.info("tick %s: vanguard %s @%s -> %s %s",
+                         tick, vdict["id"][:8], vdict["pos"], action, args)
                 self._apply_vanguard(v, action, args, occupied)
             except Exception:
                 log.exception("vanguard %s 行动异常，本 Tick 等待", vdict["id"][:8])

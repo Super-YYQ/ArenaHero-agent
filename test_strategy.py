@@ -1669,6 +1669,23 @@ def test_core_entry_queue_drains():
     assert deposits == 3, f"队列应在 60 Tick 内清空,实际交付 {deposits}"
 
 
+def test_vanguard_leaves_core_cell():
+    """Vanguard 出生在 Core 格上时立刻让出交付口,而不是蹲在上面堵门。"""
+    from pathfinding import DELTA
+    core = (0, 0)
+    v = {"id": "v1", "pos": core}
+    action, args = decide_vanguard(v, core, [], set(), {core})
+    assert action == "move", "出生在 Core 格上必须挪走"
+    dx, dy = DELTA[args[0]]
+    assert (dx, dy) != (0, 0)
+    dest = (dx, dy)
+    assert dest != core
+    # 让出后相邻蹲守:无敌不动
+    v2 = {"id": "v1", "pos": (1, 0)}
+    action2, _ = decide_vanguard(v2, core, [], set(), {(0, 0), (1, 0)})
+    assert action2 == "wait"
+
+
 def load_tests(loader, tests, pattern):
     """让 `python -m unittest discover` 也能执行本文件的普通函数测试。"""
     import unittest

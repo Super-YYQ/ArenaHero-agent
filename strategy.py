@@ -820,7 +820,8 @@ def decide_vanguard(
     """Vanguard 自卫：有敌近身先打，否则守在 Core 旁。
 
     enemies: [{'id','pos','unit_type'}] 当前可见敌方对象。
-    SWEEP 不需要目标 UUID，也不伤友军，直接朝敌方所在相邻格打。
+    SWEEP 不需要目标 UUID，也绝不会伤到自己人，直接朝敌方所在相邻格打。
+    Vanguard 绝不蹲在 Core 格上——那格是唯一的交付口，蹲上去会堵死全队。
     """
     pos = vanguard["pos"]
     adjacent_enemies = [
@@ -833,6 +834,14 @@ def decide_vanguard(
         direction = next(d for d, (ddx, ddy) in DELTA.items() if (ddx, ddy) == (dx, dy))
         return ("sweep", (direction,))
 
+    dist_core = abs(pos[0] - core_pos[0]) + abs(pos[1] - core_pos[1])
+    # 出生/滞留在 Core 格上：立刻让出交付口，挪到相邻空位
+    if dist_core == 0:
+        for d, nxt in neighbors(pos):
+            if nxt not in obstacles and nxt not in occupied:
+                return ("move", (d,))
+        return ("wait", ())
+
     # 敌人接近 Core（视野内距 Core <= 2）：迎击
     for e in sorted(enemies, key=lambda e: abs(e["pos"][0] - core_pos[0]) + abs(e["pos"][1] - core_pos[1])):
         dist_to_core = abs(e["pos"][0] - core_pos[0]) + abs(e["pos"][1] - core_pos[1])
@@ -842,7 +851,7 @@ def decide_vanguard(
                 return ("move", (d,))
 
     # 平时蹲守：回到 Core 相邻的空位（不占 Core 格）
-    if abs(pos[0] - core_pos[0]) + abs(pos[1] - core_pos[1]) > 1:
+    if dist_core > 1:
         d = step_direction(pos, core_pos, obstacles, occupied)
         if d:
             return ("move", (d,))
