@@ -767,6 +767,7 @@ def decide_worker(
     planner=None,
     threat_zones: set[tuple[int, int]] | None = None,
     core_cell_reserved: bool = False,
+    core_full: bool = False,
 ) -> tuple[str, tuple]:
     """返回 (action, args)，action ∈ {'harvest','deposit','move','wait'}。
 
@@ -799,6 +800,12 @@ def decide_worker(
             return move_or_wait(r)
         if worker["cargo"] > 0:
             if pos == core_pos:
+                # 满仓时交付必然失败:让出交付口给生产/其他 Worker,免得堵死
+                if core_full:
+                    for d, nxt in neighbors(pos):
+                        if nxt not in obstacles and nxt not in occupied:
+                            return ("move", (d,))
+                    return ("wait", ())
                 return ("deposit", ())
             # Core 格是占位实体，交付时必须走进去：allow_goal_occupied=True；
             # 但本 Tick 已有人申报进 Core 时按占用处理，在旁排队
@@ -842,6 +849,11 @@ def decide_worker(
 
     if worker["cargo"] > 0:
         if pos == core_pos:
+            if core_full:
+                for d, nxt in neighbors(pos):
+                    if nxt not in obstacles and nxt not in occupied:
+                        return ("move", (d,))
+                return ("wait", ())
             return ("deposit", ())
         # Core 格是占位实体，交付时必须走进去，所以寻路时不把 Core 格当 occupied；
         # 本 Tick 已有人申报进 Core 时保持占用，在旁排队（见 core_cell_reserved）

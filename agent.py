@@ -339,7 +339,8 @@ class Agent:
 
         # ---- Worker 行动（单 Worker 异常隔离，绝不阻塞整 Tick 提交）----
         self._run_workers(turn, workers, core_pos, assignment, obstacles, occupied,
-                          threat_cells, enemy_zones, tick)
+                          threat_cells, enemy_zones, tick,
+                          core_full=turn.resource_space <= 0)
 
         # ---- Vanguard 行动：留 vanguard_home_guard 个守家,其余随队出征 ----
         home_guard_ids = split_home_guard([v["id"] for v in vanguards],
@@ -391,7 +392,7 @@ class Agent:
 
     # ---------- 指令翻译 ----------
     def _run_workers(self, turn, workers, core_pos, assignment, obstacles, occupied,
-                     threat_cells, enemy_zones, tick) -> None:
+                     threat_cells, enemy_zones, tick, core_full: bool = False) -> None:
         """逐 Worker 决策与执行；单个 Worker 的异常只影响自己（wait），不阻塞提交。"""
         core_reserved = False  # 本 Tick 是否已有 Worker 申报进入 Core 格
         for w, wdict in zip(turn.workers, workers):
@@ -399,7 +400,7 @@ class Agent:
                 action, args = decide_worker(
                     wdict, core_pos, assignment, obstacles, occupied, threat_cells,
                     planner=self.planner, threat_zones=enemy_zones,
-                    core_cell_reserved=core_reserved,
+                    core_cell_reserved=core_reserved, core_full=core_full,
                 )
                 log.info(
                     "tick %s: worker %s @%s cargo=%s -> %s %s (target=%s explore=%s)",
