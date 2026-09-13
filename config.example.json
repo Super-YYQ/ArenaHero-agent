@@ -20,5 +20,7 @@
   "hoard_min_population": 0,
   "war_mode": false,
   "war_reserve": 0,
-  "max_rangers": 0
+  "max_rangers": 0,
+  "max_population": 20,
+  "disband_excess_workers": false
 }

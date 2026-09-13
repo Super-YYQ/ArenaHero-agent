@@ -25,7 +25,7 @@ __all__ = [
     "DELTA", "DIRECTIONS", "neighbors", "step_direction",
     "WorkerTask", "StrategyState", "assign_explore_targets", "assign_resources",
     "decide_worker", "decide_vanguard", "chunk_of", "chunk_center",
-    "pick_scout_target", "refill_tick_at_or_after", "visible_from",
+    "pick_scout_target", "refill_tick_at_or_after", "visible_from", "notable_events",
 ]
 
 
@@ -123,23 +123,124 @@ SWEEP_STARVE_TICKS = 1500         # 区块超过该 Tick 未扫则插队，防�
 ENEMY_CORE_ZONE_RADIUS = 4        # 敌方基地的路线规避圈（驻军防御范围）
 RANGER_SHOOT_RANGE = 3            # Ranger 射程：横/竖/45°斜线 1~3 格
 UNIT_HP_MAX = {"WORKER": 2, "VANGUARD": 4, "RANGER": 2}
+RETREAT_HP = 1                    # 军事单位 HP ≤ 此值时放弃出征回 Core 治疗
+
+
+RAID_SWITCH_RATIO = 0.6     # 新目标距离 ≤ 当前目标的 60%（近 ≥40%）才改道
+RAID_COMMIT_DIST = 8        # 部队离当前目标 ≤ 8 格时锁定，绝不改道
+RAID_STALE_TICKS = 1500     # 基地记录超过该 Tick 未确认视为陈旧，排在新鲜基地之后
+
+
+# 值得单独 WARNING 的事件：库存变动/战斗结果/失败原因；MOVE 事件不进日志
+CRITICAL_EVENT_PREFIXES = ("CORE_", "DEPOSIT_FAILED", "HARVEST_FAILED", "UNIT_DIED",
+                           "UNIT_DESTROYED", "UNIT_SELF_DESTRUCTED", "SHOT_HIT",
+                           "SWEEP_HIT", "UNIT_DAMAGED")
+
+
+def notable_events(events) -> tuple[list, list]:
+    """把一 Tick 的事件分成 (普通事件类型列表, [(关键事件类型, values), ...])。
+
+    MOVE 成功/失败每 Tick 都有几十条，只打前 6 个就什么都看不到（日志里
+    库存 100→6 至今没有解释）。关键事件带 values 一起记录。
+    """
+    normal: list = []
+    critical: list = []
+    for ev in events:
+        et = getattr(ev, "event_type", None)
+        name = et if isinstance(et, str) else getattr(et, "value", str(et or ""))
+        if name.startswith("UNIT_MOVE"):
+            continue
+        if name.startswith(CRITICAL_EVENT_PREFIXES):
+            critical.append((name, getattr(ev, "values", None)))
+        else:
+            normal.append(name)
+    return normal, critical
 
 
 def pick_raid_target(
     enemy_cores: dict,
     core_pos: tuple[int, int],
     exclude: frozenset = frozenset(),
+    current: tuple[int, int] | None = None,
+    army_pos: tuple[int, int] | None = None,
+    now: int | None = None,
 ) -> tuple[int, int] | None:
-    """选最近的敌方 Core 作为出征目标（确定性 tie-break）。"""
+    """选敌方 Core 作为出征目标：新鲜基地优先、其次最近（确定性 tie-break），带滞后。
+
+    now 给出时，记录超过 RAID_STALE_TICKS 未确认的基地排在所有新鲜基地之后
+    （敌人早就重生到别处了，走 60 格去看一眼很贵）。
+    current 是上一 Tick 的目标。它仍在记忆中时：部队已贴近（army_pos 距其
+    ≤ RAID_COMMIT_DIST）绝不换；否则只有新候选距离 ≤ 当前的 RAID_SWITCH_RATIO
+    才换。没有滞后时，视野边缘基地闪烁一次就让整支部队掉头一次。
+    """
     best = None
-    for cell in enemy_cores:
+    for cell, info in enemy_cores.items():
         if cell in exclude:
             continue
         d = abs(cell[0] - core_pos[0]) + abs(cell[1] - core_pos[1])
-        key = (d, cell[1], cell[0])
+        stale = 0
+        if now is not None and isinstance(info, dict):
+            stale = 1 if now - int(info.get("tick", 0) or 0) > RAID_STALE_TICKS else 0
+        key = (stale, d, cell[1], cell[0])
         if best is None or key < best[0]:
             best = (key, cell)
-    return best[1] if best else None
+    if best is None:
+        return None
+    if current is None or current not in enemy_cores or current in exclude:
+        return best[1]
+    if army_pos is not None and _manhattan(army_pos, current) <= RAID_COMMIT_DIST:
+        return current
+    cur_d = _manhattan(current, core_pos)
+    if best[0][1] <= cur_d * RAID_SWITCH_RATIO:
+        return best[1]
+    return current
+
+
+def disband_count(population: int, cap: int, resources: int) -> int:
+    """本 Tick 可以自毁的人数：人口超出 cap 的部分，且减员后容量
+    max(10, 人口×5) 仍装得下当前库存（否则超出的库存立刻销毁）。"""
+    excess = population - cap
+    if excess <= 0:
+        return 0
+    n = 0
+    while n < excess and max(10, (population - n - 1) * 5) >= resources:
+        n += 1
+    return n
+
+
+def pick_units_to_disband(workers: list[dict], core_pos: tuple[int, int], excess: int) -> list[str]:
+    """人口超上限时选 excess 个 Worker 自毁：空载优先、离 Core 最远优先。
+
+    背货的不拆（Cargo 会掉在原地成资源堆，白跑一趟）。自毁不退款，
+    但立即降低后续单价，且人口下降会缩容——调用方须先花掉库存再减员。
+    """
+    if excess <= 0:
+        return []
+    cands = [w for w in workers if w.get("cargo", 0) == 0]
+    cands.sort(key=lambda w: (-_manhattan(w["pos"], core_pos), w["id"]))
+    return [w["id"] for w in cands[:excess]]
+
+
+def _wounded(unit: dict) -> bool:
+    hp = unit.get("hp")
+    return hp is not None and hp <= RETREAT_HP
+
+
+def _march(unit: dict, pos, goal, obstacles, occupied, forbidden, planner, threat_zones):
+    """军事单位向 goal 行军一步（规划器优先，否则贪心）。"""
+    if planner is not None:
+        r = planner.next_step(
+            unit["id"], pos, goal, obstacles=obstacles, occupied=occupied,
+            forbidden=forbidden, threat=frozenset(threat_zones or ()),
+            goal_kind="scout", allow_goal_occupied=True,
+        )
+        if r.steps:
+            return ("move", (r.steps[0],))
+        return ("wait", ())
+    d = step_direction(pos, goal, obstacles, occupied, forbidden=forbidden)
+    if d:
+        return ("move", (d,))
+    return ("wait", ())
 
 
 def split_home_guard(vanguard_ids: list[str], home_guard_count: int) -> set[str]:
@@ -188,6 +289,34 @@ def ranger_shoot_cell(
         if best is None or key < best[0]:
             best = (key, (ex, ey))
     return best[1] if best else None
+
+
+def occupied_cells(core_pos, enemies, workers, vanguards, rangers) -> set:
+    """本 Tick 起始被占用的格子：Core 是占位实体，敌人与己方所有 Unit 也占格。"""
+    occ = {core_pos} if core_pos else set()
+    for group in (enemies, workers, vanguards, rangers):
+        for u in group:
+            occ.add(u["pos"])
+    return occ
+
+
+def raid_threat_zones(zones: set, target: tuple[int, int] | None, radius: int = ENEMY_CORE_ZONE_RADIUS) -> set:
+    """出征部队用的路线惩罚圈：去掉自己攻城目标周围 radius 格，
+    否则 A*/前沿会先在圈外绕一圈才肯进。"""
+    if target is None:
+        return zones
+    tx, ty = target
+    return {c for c in zones if abs(c[0] - tx) + abs(c[1] - ty) > radius}
+
+
+def _sweep_priority(enemy: dict) -> int:
+    """SWEEP 目标优先级：正在打我的攻击单位 > 敌方 Core > Worker。"""
+    name = getattr(enemy.get("unit_type"), "name", enemy.get("unit_type"))
+    if name in ("VANGUARD", "RANGER"):
+        return 0
+    if name is None:
+        return 1
+    return 2
 
 
 def enemy_threat_cells(
@@ -349,40 +478,41 @@ def refill_tick_at_or_after(tick: int) -> int:
 
 
 def _los_clear(frm: tuple[int, int], to: tuple[int, int], obstacles: set[tuple[int, int]]) -> bool:
-    """整数 supercover：中间格有障碍则看不见终点（障碍格本身可见）。"""
+    """整数 supercover：中间格有障碍则看不见终点（障碍格本身可见）。
+
+    射线从格中心到格中心；正好穿过两格共用的角时两侧都算经过，任一侧是障碍
+    就挡住（规则《地图与视野》）。用 (1+2i)·n 的整数比较判定角穿越，无浮点。
+    早先的 Bresenham 单格步进会把这种情况算成可见，导致我们的视野是服务端的
+    超集，进而误删视野边缘的资源/敌方 Core 记忆。
+    """
     x0, y0 = frm
     x1, y1 = to
-    dx = abs(x1 - x0)
-    dy = abs(y1 - y0)
+    nx, ny = abs(x1 - x0), abs(y1 - y0)
     sx = 1 if x1 >= x0 else -1
     sy = 1 if y1 >= y0 else -1
     x, y = x0, y0
-    if dx == 0 and dy == 0:
-        return True
-    if dx >= dy:
-        err = dx
-        for _ in range(dx):
+    ix = iy = 0
+    while ix < nx or iy < ny:
+        a = (1 + 2 * ix) * ny
+        b = (1 + 2 * iy) * nx
+        if a == b:
+            # 穿角：两侧格都算经过
+            if (x + sx, y) in obstacles or (x, y + sy) in obstacles:
+                return False
             x += sx
-            err += 2 * dy
-            if err >= 2 * dx:
-                y += sy
-                err -= 2 * dx
-            if (x, y) == (x1, y1):
-                return True
-            if (x, y) in obstacles:
-                return False
-    else:
-        err = dy
-        for _ in range(dy):
             y += sy
-            err += 2 * dx
-            if err >= 2 * dy:
-                x += sx
-                err -= 2 * dy
-            if (x, y) == (x1, y1):
-                return True
-            if (x, y) in obstacles:
-                return False
+            ix += 1
+            iy += 1
+        elif a < b:
+            x += sx
+            ix += 1
+        else:
+            y += sy
+            iy += 1
+        if (x, y) == (x1, y1):
+            return True
+        if (x, y) in obstacles:
+            return False
     return True
 
 
@@ -757,6 +887,23 @@ def assign_resources(
     return assignment
 
 
+def core_cell_reserved(workers: list[dict], core_pos: tuple[int, int], core_full: bool) -> bool:
+    """Core 格里是否已有本 Tick 不会离开的 Worker（交付或治疗）。
+
+    Core 格容量 = Core + 1 个 Unit；有人留在里面时其他 Worker 不能再申报进入，
+    否则服务端整批拒绝移动（日志里的 UNIT_MOVE_FAILED 大部分来自这里）。
+    """
+    for w in workers:
+        if w["pos"] != core_pos:
+            continue
+        if w.get("cargo", 0) > 0 and not core_full:
+            return True
+        hp, hp_max = w.get("hp"), w.get("hp_max")
+        if hp is not None and hp_max and hp < hp_max:
+            return True
+    return False
+
+
 def decide_worker(
     worker: dict,
     core_pos: tuple[int, int],
@@ -920,14 +1067,16 @@ def decide_vanguard(
     raid_target 由 agent 按"兵数超过留家数"指派——出征与生产解耦:
     库存门槛只管补员,已出征的部队不管库存如何都继续作战。
     planner 用于跨区长途行军（贪心单步会卡死在障碍上）。
+    last_pos（上一 Tick 所在格）与 Worker 同样用作禁回头，打断两格振荡。
     """
     pos = vanguard["pos"]
+    forbidden = {vanguard["last_pos"]} if vanguard.get("last_pos") else set()
     adjacent_enemies = [
         e for e in enemies
         if abs(e["pos"][0] - pos[0]) + abs(e["pos"][1] - pos[1]) == 1
     ]
     if adjacent_enemies:
-        e = adjacent_enemies[0]
+        e = min(adjacent_enemies, key=lambda e: (_sweep_priority(e), e["pos"][1], e["pos"][0]))
         dx, dy = e["pos"][0] - pos[0], e["pos"][1] - pos[1]
         direction = next(d for d, (ddx, ddy) in DELTA.items() if (ddx, ddy) == (dx, dy))
         return ("sweep", (direction,))
@@ -943,23 +1092,16 @@ def decide_vanguard(
                 return ("move", (d,))
         return ("wait", ())
 
+    # 带伤撤退：HP ≤ RETREAT_HP 时回 Core 格治疗（HEAL 一次回满，1 资源/HP），
+    # 死一个 Vanguard 要再花 10~22 资源，远贵过回家的路程
+    if _wounded(vanguard):
+        return _march(vanguard, pos, core_pos, obstacles, occupied, forbidden, planner, threat_zones)
+
     # 出征：被指派目标时向其行军；到达相邻位后上面的
     # adjacent_enemies 分支自动 SWEEP 围攻（相邻 1 格 = SWEEP 射程）
     if raid_target is not None:
         if abs(pos[0] - raid_target[0]) + abs(pos[1] - raid_target[1]) > 1:
-            if planner is not None:
-                r = planner.next_step(
-                    vanguard["id"], pos, raid_target, obstacles=obstacles,
-                    occupied=occupied, threat=frozenset(threat_zones or ()),
-                    goal_kind="scout",
-                )
-                if r.steps:
-                    return ("move", (r.steps[0],))
-                return ("wait", ())
-            d = step_direction(pos, raid_target, obstacles, occupied)
-            if d:
-                return ("move", (d,))
-            return ("wait", ())
+            return _march(vanguard, pos, raid_target, obstacles, occupied, forbidden, planner, threat_zones)
         return ("wait", ())
 
     # 敌人接近 Core（视野内距 Core <= 2）：迎击
@@ -989,8 +1131,10 @@ def decide_ranger(
     threat_zones: set[tuple[int, int]] | None = None,
 ) -> tuple[str, tuple]:
     """Ranger：射程（横/竖/斜 1~3 格）内见敌就射（优先敌方 Core）；
-    被指派出征时随队行军,到目标相邻位开火；否则回 Core 旁待命。"""
+    被指派出征时随队行军,到目标相邻位开火；否则回 Core 旁待命。
+    last_pos 用作禁回头（同 Vanguard）。"""
     pos = ranger["pos"]
+    forbidden = {ranger["last_pos"]} if ranger.get("last_pos") else set()
     # 1) 射程内最优目标
     cell = ranger_shoot_cell(pos, enemies, obstacles)
     if cell is not None:
@@ -1007,22 +1151,14 @@ def decide_ranger(
                 return ("move", (d,))
         return ("wait", ())
 
+    # 2.5) 带伤撤退（Ranger 只有 2 HP，HP 1 再挨一下就没了）
+    if _wounded(ranger):
+        return _march(ranger, pos, core_pos, obstacles, occupied, forbidden, planner, threat_zones)
+
     # 3) 出征：行军到目标相邻位（相邻必在射程内,停下开火）
     if raid_target is not None:
         if abs(pos[0] - raid_target[0]) + abs(pos[1] - raid_target[1]) > 1:
-            if planner is not None:
-                r = planner.next_step(
-                    ranger["id"], pos, raid_target, obstacles=obstacles,
-                    occupied=occupied, threat=frozenset(threat_zones or ()),
-                    goal_kind="scout",
-                )
-                if r.steps:
-                    return ("move", (r.steps[0],))
-                return ("wait", ())
-            d = step_direction(pos, raid_target, obstacles, occupied)
-            if d:
-                return ("move", (d,))
-            return ("wait", ())
+            return _march(ranger, pos, raid_target, obstacles, occupied, forbidden, planner, threat_zones)
         return ("wait", ())
 
     # 4) 平时蹲守：回到 Core 相邻的空位

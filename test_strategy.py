@@ -1493,15 +1493,24 @@ from arena_hero import CoreState, UnitType
 class _FakeCoreView:
     state = CoreState.NORMAL
     hp = 5
+    shield = 5
 
 
 class _FakeCore:
     def __init__(self):
         self.view = _FakeCoreView()
         self.spawned = []
+        self.actions = []
 
     def spawn(self, unit_type):
         self.spawned.append(unit_type)
+        self.actions.append("spawn")
+
+    def heal(self):
+        self.actions.append("heal")
+
+    def repair_shield(self):
+        self.actions.append("repair_shield")
 
 
 def _fake_turn(resources, population=10, tick=1):
@@ -1846,6 +1855,214 @@ def test_military_replenish_gate():
     # 库存恢复 → 补员
     ag._decide_core(_fake_turn(85), core, n_workers=19, n_vanguards=0, military_ok=True)
     assert core.spawned == [UnitType.VANGUARD]
+
+
+def test_military_raid_march_avoids_stepping_back():
+    """出征行军与 Worker 一样禁止回头（last_pos），打断两格振荡。"""
+    from pathfinding import HybridPathPlanner
+    from strategy import decide_ranger, decide_vanguard
+    for fn in (decide_vanguard, decide_ranger):
+        p = HybridPathPlanner()
+        p.begin_tick(0)
+        unit = {"id": "m1", "pos": (1, 1), "hp": 4, "hp_max": 4, "last_pos": (2, 1)}
+        action, args = fn(unit, (0, 0), [], set(), set(), planner=p,
+                          raid_target=(3, 0))
+        assert action == "move", (fn.__name__, action)
+        assert args[0] != "RIGHT", f"{fn.__name__} 回头走进了 last_pos"
+
+
+def test_memory_observe_reports_new_obstacles():
+    """observe 返回本 Tick 新增的障碍格，供规划器做选择性路线失效。"""
+    import tempfile
+    from pathlib import Path
+    from memory import MapMemory
+    tmp = Path(tempfile.mkdtemp()) / "m.json"
+    mem = MapMemory(tmp)
+    assert mem.observe(1, [(1, 1)], [], (0, 0)) == {(1, 1)}
+    assert mem.observe(2, [(1, 1), (2, 2)], [], (0, 0)) == {(2, 2)}
+    assert mem.observe(3, [(1, 1)], [], (0, 0)) == set()
+
+
+def test_los_corner_crossing_blocked_by_either_side():
+    """规则：射线正好从两格共用的角穿过时两侧都算经过，任一侧是障碍就挡住。"""
+    from strategy import _los_clear
+    assert not _los_clear((0, 0), (2, 2), {(1, 0)})
+    assert not _los_clear((0, 0), (2, 2), {(0, 1)})
+    assert not _los_clear((0, 0), (-2, 2), {(-1, 0)})
+    assert not _los_clear((0, 0), (2, -2), {(0, -1)})
+    # 不过角的直线不受两侧影响
+    assert _los_clear((0, 0), (3, 0), {(1, 1), (1, -1)})
+    # (0,0)->(2,1) 射线在 x=1 处穿过 (1,0)/(1,1) 共用边：两格都算经过
+    assert not _los_clear((0, 0), (2, 1), {(1, 0)})
+    assert not _los_clear((0, 0), (2, 1), {(1, 1)})
+    # 无障碍时一切可见；障碍格本身可见
+    assert _los_clear((0, 0), (2, 2), set())
+    assert _los_clear((0, 0), (2, 2), {(2, 2)})
+    assert _los_clear((0, 0), (1, 1), {(1, 1)})
+
+
+def test_raid_target_is_sticky():
+    """出征目标带滞后：已选目标不因新发现略近的基地而改道；
+    目标从记忆中消失才换；新目标近 ≥40% 才换；部队已贴近（≤8 格）绝不换。"""
+    from strategy import pick_raid_target
+    core = (0, 0)
+    cores = {(30, 0): {}, (0, 26): {}}
+    assert pick_raid_target(cores, core) == (0, 26)
+    # 已锁定 (30,0)，新出现的 (0,26) 只近 13%：不换
+    assert pick_raid_target(cores, core, current=(30, 0)) == (30, 0)
+    # 新目标近 ≥40%：换
+    cores2 = {(30, 0): {}, (0, 15): {}}
+    assert pick_raid_target(cores2, core, current=(30, 0)) == (0, 15)
+    # 部队已贴近当前目标：即使有近得多的新目标也不换
+    assert pick_raid_target(cores2, core, current=(30, 0), army_pos=(25, 0)) == (30, 0)
+    # 当前目标从记忆中消失：重新选
+    assert pick_raid_target({(0, 26): {}}, core, current=(30, 0)) == (0, 26)
+
+
+def test_notable_events_drops_moves_and_flags_critical():
+    """日志里 6 个 MOVE 事件淹没了一切：过滤 MOVE，关键事件单独标记。"""
+    from strategy import notable_events
+
+    class Ev:
+        def __init__(self, t, values=None):
+            self.event_type = t
+            self.values = values
+
+    evs = [Ev("UNIT_MOVE_SUCCEEDED")] * 6 + [
+        Ev("UNIT_MOVE_FAILED"), Ev("HARVEST_SUCCEEDED"),
+        Ev("CORE_RESOURCE_OVERFLOW_DESTROYED", {"destroyed": 94}),
+        Ev("DEPOSIT_FAILED"), Ev("CORE_RESOURCES_CAPTURED", {"amount": 5}),
+    ]
+    normal, critical = notable_events(evs)
+    assert normal == ["HARVEST_SUCCEEDED"]
+    assert [c[0] for c in critical] == [
+        "CORE_RESOURCE_OVERFLOW_DESTROYED", "DEPOSIT_FAILED", "CORE_RESOURCES_CAPTURED"]
+    assert critical[0][1] == {"destroyed": 94}
+
+
+def test_core_repairs_shield_before_spawning():
+    """护盾 1 资源 1 点、伤害先扣盾：盾没满就先修盾，再生产。"""
+    ag = _hoard_agent({"max_workers": 19})
+    core = _FakeCore()
+    core.view.shield = 3
+    ag._decide_core(_fake_turn(50), core, n_workers=5, n_vanguards=0)
+    assert core.actions == ["repair_shield"], core.actions
+    core2 = _FakeCore()
+    core2.view.hp = 4
+    core2.view.shield = 3
+    ag._decide_core(_fake_turn(50), core2, n_workers=5, n_vanguards=0)
+    assert core2.actions == ["heal"], "HP 优先于护盾"
+
+
+def test_population_cap_limits_total_units():
+    """max_population 是 Worker+Vanguard+Ranger 的总上限：到顶后不再生产任何单位。"""
+    ag = _hoard_agent({"max_workers": 19, "max_vanguards": 4, "max_rangers": 2,
+                       "max_population": 20})
+    core = _FakeCore()
+    ag._decide_core(_fake_turn(200, population=20), core, n_workers=16, n_vanguards=3,
+                    n_rangers=1, military_ok=True)
+    assert core.spawned == [], "人口已达 max_population"
+    ag._decide_core(_fake_turn(200, population=19), core, n_workers=16, n_vanguards=2,
+                    n_rangers=1, military_ok=True)
+    assert len(core.spawned) == 1, "人口 19 < 20 还能生产一个"
+
+
+def test_excess_workers_marked_for_self_destruct():
+    """人口超过 max_population 时，多出的 Worker 自毁减员（空载、离 Core 最远者优先）。"""
+    from strategy import pick_units_to_disband
+    workers = [
+        {"id": "a", "pos": (0, 5), "cargo": 0},
+        {"id": "b", "pos": (0, 9), "cargo": 1},   # 背货不拆
+        {"id": "c", "pos": (0, 12), "cargo": 0},
+        {"id": "d", "pos": (0, 1), "cargo": 0},
+    ]
+    assert pick_units_to_disband(workers, (0, 0), excess=2) == ["c", "a"]
+    assert pick_units_to_disband(workers, (0, 0), excess=0) == []
+
+
+def test_disband_count_respects_capacity():
+    """减员前先保证库存装得下：容量 = 人口×5，超出的库存会被销毁。"""
+    from strategy import disband_count
+    # 25 人、上限 20、库存 90：一次拆 2 人容量 115 仍够；拆 5 人容量 100 也够
+    assert disband_count(population=25, cap=20, resources=90) == 5
+    # 库存 118：只能拆到人口 24（容量 120）
+    assert disband_count(population=25, cap=20, resources=118) == 1
+    assert disband_count(population=25, cap=20, resources=125) == 0
+    assert disband_count(population=20, cap=20, resources=0) == 0
+
+
+def test_wounded_military_retreats_to_core_instead_of_raiding():
+    """Vanguard HP≤1 / Ranger HP≤1 时放弃出征回 Core 治疗；相邻有敌仍先打（同归于尽也算数）。"""
+    from strategy import decide_ranger, decide_vanguard
+    core = (0, 0)
+    v = {"id": "v", "pos": (10, 0), "hp": 1, "hp_max": 4}
+    action, args = decide_vanguard(v, core, [], set(), set(), raid_target=(20, 0))
+    assert (action, args) == ("move", ("LEFT",)), (action, args)
+    r = {"id": "r", "pos": (10, 0), "hp": 1, "hp_max": 2}
+    action, args = decide_ranger(r, core, [], set(), set(), raid_target=(20, 0))
+    assert (action, args) == ("move", ("LEFT",)), (action, args)
+    # 相邻有敌：照打
+    enemy = [{"id": "e", "pos": (11, 0), "unit_type": "VANGUARD"}]
+    assert decide_vanguard(v, core, enemy, set(), set(), raid_target=(20, 0))[0] == "sweep"
+    # 满血照常出征
+    v_ok = {"id": "v", "pos": (10, 0), "hp": 4, "hp_max": 4}
+    assert decide_vanguard(v_ok, core, [], set(), set(), raid_target=(20, 0)) == ("move", ("RIGHT",))
+
+
+def test_occupied_cells_include_rangers():
+    """占位集合必须包含 Ranger（之前漏掉，Worker 会往 Ranger 站的格里挤）。"""
+    from strategy import occupied_cells
+    occ = occupied_cells((0, 0), enemies=[{"pos": (5, 5)}], workers=[{"pos": (1, 0)}],
+                         vanguards=[{"pos": (2, 0)}], rangers=[{"pos": (3, 0)}])
+    assert occ == {(0, 0), (5, 5), (1, 0), (2, 0), (3, 0)}
+    assert occupied_cells(None, [], [], [], []) == set()
+
+
+def test_vanguard_sweeps_attacker_before_core():
+    """相邻同时有敌方 Core 和能打我的 Vanguard/Ranger 时先打攻击单位；
+    Core 次之；Worker 最后。"""
+    from strategy import decide_vanguard
+    v = {"id": "v", "pos": (10, 10), "hp": 4, "hp_max": 4}
+    enemies = [
+        {"id": "c", "pos": (11, 10), "unit_type": None},
+        {"id": "w", "pos": (10, 11), "unit_type": "WORKER"},
+        {"id": "a", "pos": (9, 10), "unit_type": "VANGUARD"},
+    ]
+    assert decide_vanguard(v, (0, 0), enemies, set(), set()) == ("sweep", ("LEFT",))
+    enemies_no_attacker = enemies[:2]
+    assert decide_vanguard(v, (0, 0), enemies_no_attacker, set(), set()) == ("sweep", ("RIGHT",))
+
+
+def test_raid_zone_excludes_own_target():
+    """出征目标周围的规避圈不应惩罚自己的攻城路线。"""
+    from strategy import raid_threat_zones
+    zones = {(x, y) for x in range(-5, 6) for y in range(-5, 6)}
+    kept = raid_threat_zones(zones, target=(0, 0), radius=4)
+    assert (0, 0) not in kept and (4, 0) not in kept and (2, 2) not in kept
+    assert (5, 0) in kept and (3, 3) in kept
+    assert raid_threat_zones(zones, target=None, radius=4) == zones
+
+
+def test_raid_target_prefers_fresh_bases():
+    """久未确认的基地降权：4000 Tick 前的记录不应压过 200 Tick 前确认的略远基地。"""
+    from strategy import pick_raid_target
+    cores = {(20, 0): {"tick": 1000}, (0, 26): {"tick": 4800}}
+    assert pick_raid_target(cores, (0, 0), now=5000) == (0, 26)
+    # 都新鲜时仍取最近
+    cores2 = {(20, 0): {"tick": 4900}, (0, 26): {"tick": 4800}}
+    assert pick_raid_target(cores2, (0, 0), now=5000) == (20, 0)
+
+
+def test_core_cell_reserved_by_worker_staying_inside():
+    """Core 格里已有 Worker 本 Tick 要交付/治疗（不会离开）时，Core 格视为已申报。"""
+    from strategy import core_cell_reserved
+    core = (0, 0)
+    assert core_cell_reserved([{"pos": core, "cargo": 1, "hp": 2, "hp_max": 2}], core, core_full=False)
+    assert core_cell_reserved([{"pos": core, "cargo": 0, "hp": 1, "hp_max": 2}], core, core_full=False)
+    # 空载满血站在 Core 上会被赶走（decide_worker 让位）；满仓时背货的也会让位
+    assert not core_cell_reserved([{"pos": core, "cargo": 0, "hp": 2, "hp_max": 2}], core, core_full=False)
+    assert not core_cell_reserved([{"pos": core, "cargo": 1, "hp": 2, "hp_max": 2}], core, core_full=True)
+    assert not core_cell_reserved([{"pos": (1, 0), "cargo": 1, "hp": 2, "hp_max": 2}], core, core_full=False)
 
 
 def load_tests(loader, tests, pattern):

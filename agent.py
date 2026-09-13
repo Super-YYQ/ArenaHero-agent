@@ -26,11 +26,17 @@ from strategy import (
     assign_explore_targets,
     assign_resources,
     chunk_of,
+    core_cell_reserved,
     decide_ranger,
     decide_vanguard,
     decide_worker,
+    disband_count,
     enemy_threat_cells,
+    notable_events,
+    occupied_cells,
     pick_raid_target,
+    pick_units_to_disband,
+    raid_threat_zones,
     refill_tick_at_or_after,
     split_home_guard,
     visible_from,
@@ -60,6 +66,10 @@ PLANNER_DEFAULTS = {
     "war_reserve": 0,
     "max_rangers": 0,
     "vanguard_home_guard": 1,
+    # 总人口硬上限（W+V+R）。第 21 个单位起价格 ×1.3、每 5 人再乘；默认 20 = 全基础价
+    "max_population": 20,
+    # 人口超 max_population 时是否让多余 Worker 自毁（不退款、不可逆；默认关）
+    "disband_excess_workers": False,
 }
 # 数值型配置的合理上限，超出视为非法
 PLANNER_INT_LIMITS = {
@@ -73,6 +83,7 @@ PLANNER_INT_LIMITS = {
     "hoard_until_resources": 100_000,
     "hoard_min_population": 200,
     "vanguard_home_guard": 50,
+    "max_population": 200,
 }
 
 
@@ -196,7 +207,7 @@ class Agent:
             visible_cells |= visible_from((u.position[0], u.position[1]), VISION["VANGUARD"], obstacles_now)
         for u in turn.rangers:
             visible_cells |= visible_from((u.position[0], u.position[1]), VISION["RANGER"], obstacles_now)
-        self.mem.observe(
+        new_obstacles = self.mem.observe(
             tick,
             turn.obstacle_cells,
             turn.resource_cells,
@@ -209,7 +220,9 @@ class Agent:
         self.strat.map_version = self.mem.obstacle_revision
         if self.planner is not None:
             is_known = self.mem.chunk_index.is_known if self.mem.chunk_index else None
-            self.planner.begin_tick(self.strat.map_version, is_known=is_known)
+            # 只淘汰剩余路径撞上新障碍的路线，其余继续沿用（防全清导致振荡）
+            self.planner.begin_tick(self.strat.map_version, is_known=is_known,
+                                    new_obstacles=new_obstacles)
         # 记录本 Tick 视野覆盖到的 32×32 区块，供侦察选「最久未见」
         for cell in visible_cells:
             self.strat.chunk_last_seen[chunk_of(cell)] = tick
@@ -251,12 +264,14 @@ class Agent:
         ]
         vanguards = [
             {"id": str(v.id), "pos": (v.position[0], v.position[1]),
-             "hp": v.hp, "hp_max": UNIT_HP_MAX["VANGUARD"]}
+             "hp": v.hp, "hp_max": UNIT_HP_MAX["VANGUARD"],
+             "last_pos": self.strat.last_pos.get(str(v.id))}
             for v in turn.vanguards
         ]
         rangers = [
             {"id": str(r_.id), "pos": (r_.position[0], r_.position[1]),
-             "hp": r_.hp, "hp_max": UNIT_HP_MAX["RANGER"]}
+             "hp": r_.hp, "hp_max": UNIT_HP_MAX["RANGER"],
+             "last_pos": self.strat.last_pos.get(str(r_.id))}
             for r_ in turn.rangers
         ]
         enemies = [
@@ -266,14 +281,8 @@ class Agent:
             for e in turn.visible_enemies
         ]
         obstacles = set(self.mem.obstacles)
-        # 本 Tick 已被占用/计划占用的格子。Core 是占位实体，敌人也占格
-        occupied = {core_pos} if core_pos else set()
-        for e in enemies:
-            occupied.add(e["pos"])
-        for wdict in workers:
-            occupied.add(wdict["pos"])
-        for vdict in vanguards:
-            occupied.add(vdict["pos"])
+        # 本 Tick 已被占用/计划占用的格子。Core 是占位实体，敌人与己方所有 Unit 也占格
+        occupied = occupied_cells(core_pos, enemies, workers, vanguards, rangers)
         if core is None:
             return
 
@@ -297,7 +306,17 @@ class Agent:
         war_ongoing = self.pcfg["war_mode"]
         military_ok = war_ongoing and (self.pcfg["war_reserve"] <= 0
                                        or turn.resources >= self.pcfg["war_reserve"])
-        raid_target = pick_raid_target(self.mem.enemy_cores, core_pos) if war_ongoing else None
+        # 出征部队的"前锋位置"= 离上一目标最近的军事单位，用于贴近锁定
+        army_pos = None
+        if war_ongoing and self._last_raid_target is not None:
+            troops = [u["pos"] for u in vanguards + rangers]
+            if troops:
+                army_pos = min(troops, key=lambda p: abs(p[0] - self._last_raid_target[0])
+                               + abs(p[1] - self._last_raid_target[1]))
+        raid_target = pick_raid_target(
+            self.mem.enemy_cores, core_pos,
+            current=self._last_raid_target, army_pos=army_pos, now=tick,
+        ) if war_ongoing else None
         if war_ongoing and raid_target != self._last_raid_target:
             log.info("tick %s: 战争模式，出征目标 %s（记忆中敌方基地 %s 个）",
                      tick, raid_target, len(self.mem.enemy_cores))
@@ -337,26 +356,38 @@ class Agent:
             sweep=self.pcfg["enable_chunk_sweep"], avoid_zones=enemy_zones,
         )
 
+        # ---- 减员：人口超上限且开启自毁时，空载最远的 Worker 自毁（先保库存不溢出）----
+        disband: set[str] = set()
+        if self.pcfg["disband_excess_workers"]:
+            n = disband_count(turn.state.population, self.pcfg["max_population"], turn.resources)
+            disband = set(pick_units_to_disband(workers, core_pos, n))
+            if disband:
+                log.warning("tick %s: 人口 %s 超上限 %s，自毁 Worker %s",
+                            tick, turn.state.population, self.pcfg["max_population"],
+                            [d[:8] for d in disband])
+
         # ---- Worker 行动（单 Worker 异常隔离，绝不阻塞整 Tick 提交）----
         self._run_workers(turn, workers, core_pos, assignment, obstacles, occupied,
                           threat_cells, enemy_zones, tick,
-                          core_full=turn.resource_space <= 0)
+                          core_full=turn.resource_space <= 0, disband=disband)
 
         # ---- Vanguard 行动：留 vanguard_home_guard 个守家,其余随队出征 ----
         home_guard_ids = split_home_guard([v["id"] for v in vanguards],
                                           self.pcfg["vanguard_home_guard"])
+        raid_zones = raid_threat_zones(enemy_zones, raid_target)
         for v, vdict in zip(turn.vanguards, vanguards):
             try:
                 raid = raid_target if vdict["id"] not in home_guard_ids else None
                 action, args = decide_vanguard(
                     vdict, core_pos, enemies, obstacles, occupied,
                     planner=self.planner, raid_target=raid,
-                    threat_zones=enemy_zones,
+                    threat_zones=raid_zones if raid else enemy_zones,
                 )
                 log.info("tick %s: vanguard %s @%s -> %s %s%s",
                          tick, vdict["id"][:8], vdict["pos"], action, args,
                          " [出征]" if raid else "")
                 self._apply_vanguard(v, action, args, occupied)
+                self.strat.last_pos[vdict["id"]] = vdict["pos"]
             except Exception:
                 log.exception("vanguard %s 行动异常，本 Tick 等待", vdict["id"][:8])
                 try:
@@ -370,11 +401,12 @@ class Agent:
                 action, args = decide_ranger(
                     rdict, core_pos, enemies, obstacles, occupied,
                     planner=self.planner, raid_target=raid_target,
-                    threat_zones=enemy_zones,
+                    threat_zones=raid_zones,
                 )
                 log.info("tick %s: ranger %s @%s -> %s %s",
                          tick, rdict["id"][:8], rdict["pos"], action, args)
                 self._apply_ranger(r_, action, args, occupied)
+                self.strat.last_pos[rdict["id"]] = rdict["pos"]
             except Exception:
                 log.exception("ranger %s 行动异常，本 Tick 等待", rdict["id"][:8])
                 try:
@@ -392,11 +424,17 @@ class Agent:
 
     # ---------- 指令翻译 ----------
     def _run_workers(self, turn, workers, core_pos, assignment, obstacles, occupied,
-                     threat_cells, enemy_zones, tick, core_full: bool = False) -> None:
+                     threat_cells, enemy_zones, tick, core_full: bool = False,
+                     disband: set | None = None) -> None:
         """逐 Worker 决策与执行；单个 Worker 的异常只影响自己（wait），不阻塞提交。"""
-        core_reserved = False  # 本 Tick 是否已有 Worker 申报进入 Core 格
+        # 本 Tick 是否已有 Worker 占着/申报进入 Core 格（留在里面交付/治疗的也算）
+        core_reserved = core_cell_reserved(workers, core_pos, core_full)
+        disband = disband or set()
         for w, wdict in zip(turn.workers, workers):
             try:
+                if wdict["id"] in disband:
+                    self._apply_worker(w, "self_destruct", (), occupied)
+                    continue
                 action, args = decide_worker(
                     wdict, core_pos, assignment, obstacles, occupied, threat_cells,
                     planner=self.planner, threat_zones=enemy_zones,
@@ -475,6 +513,8 @@ class Agent:
                 self.strat.worker_tasks.pop(str(w.id), None)
             elif action == "heal":
                 w.heal()
+            elif action == "self_destruct":
+                w.self_destruct()
             elif action == "wait":
                 w.wait()
         except Exception:
@@ -526,6 +566,12 @@ class Agent:
                 core.heal()
                 log.info("tick %s: Core 自疗（HP %s/5）", turn.tick, core.view.hp)
                 return
+            # 修盾：1 资源 1 盾，伤害先扣盾——最便宜的防御，排在 HP 之后、生产之前
+            shield = getattr(core.view, "shield", None)
+            if shield is not None and shield < 5 and turn.resources > reserve:
+                core.repair_shield()
+                log.info("tick %s: Core 修盾（%s/5）", turn.tick, shield)
+                return
             # 攒钱模式：暂停一切生产；设置了目标库存时，达标后永久恢复生产。
             # hoard_min_population：人口未达标前先正常扩张（容量=人口×5，
             # 过早攒钱会被容量墙卡死——库存款不进、人口不涨）。
@@ -546,6 +592,8 @@ class Agent:
                     return
             if military_ok is None:
                 military_ok = True  # 非战争模式:军备按上限正常生产(守家行为)
+            if n_workers + n_vanguards + n_rangers >= self.pcfg["max_population"]:
+                return  # 总人口到顶：任何单位都不再生产
             # min_spawn_reserve：只在 resources - price ≥ reserve 时才生产，保住底仓
             if n_workers < self.cfg["max_workers"]:
                 price = unit_cost(UnitType.WORKER, turn.state.population)
@@ -580,14 +628,16 @@ class Agent:
 
     def _log_progress(self, tick: int, turn) -> None:
         cargos = sum(w.cargo for w in turn.workers)
-        events_types = [e.event_type for e in turn.events[:6]]
+        events_types, critical = notable_events(turn.events)
         log.info(
-            "tick %s: 资源 %s/%s 人口 %s Worker=%s Vanguard=%s 视野资源=%s 记忆资源=%s 敌人=%s cargo总和=%s 事件=%s",
+            "tick %s: 资源 %s/%s 人口 %s Worker=%s Vanguard=%s Ranger=%s 视野资源=%s 记忆资源=%s 敌人=%s cargo总和=%s 事件=%s",
             tick, turn.resources, turn.resource_capacity,
             turn.state.population, len(turn.workers), len(turn.vanguards),
-            len(turn.resource_cells), len(self.mem.resource_seen),
+            len(turn.rangers), len(turn.resource_cells), len(self.mem.resource_seen),
             len(turn.visible_enemies), cargos, events_types,
         )
+        for name, values in critical:
+            log.warning("tick %s: 关键事件 %s %s", tick, name, values if values is not None else "")
 
 
 def main() -> None:

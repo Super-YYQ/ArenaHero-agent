@@ -37,6 +37,8 @@ python agent.py
 |---|---|---|
 | `max_workers` | 10 | Worker 人口上限 |
 | `max_vanguards` | 2 | 自卫 Vanguard 上限 |
+| `max_population` | 20 | Worker+Vanguard+Ranger 总上限。第 21 个单位起全部单价 ×1.3、每多 5 人再乘一次 |
+| `disband_excess_workers` | false | 人口超 `max_population` 时让空载最远的 Worker 自毁减员（不退款、不可逆；会先保证库存不因缩容销毁） |
 | `log_level` | INFO | 日志级别 |
 
 **不要把 `config.json` 提交到 git。** 它已被 `.gitignore` 忽略。Key 相当于账号凭据。

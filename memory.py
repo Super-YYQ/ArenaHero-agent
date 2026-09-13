@@ -124,15 +124,15 @@ class MapMemory:
         self._last_save = time.monotonic()
 
     # ---------- 更新 ----------
-    def observe(self, tick: int, obstacle_cells, resource_cells, core_pos, visible_cells=None) -> None:
-        """把本 Tick 视野合并进记忆。
+    def observe(self, tick: int, obstacle_cells, resource_cells, core_pos, visible_cells=None) -> set:
+        """把本 Tick 视野合并进记忆。返回本 Tick 新增的障碍格集合。
 
         visible_cells: 当前可见的所有格子（含空地）。传入后，视野内已消失的资源点
         会被立刻从记忆中删除，避免 Worker 反复 harvest 一个已被采空的点。
         """
-        before = len(self.obstacles)
-        self.obstacles |= {tuple(c) for c in obstacle_cells}
-        if len(self.obstacles) != before:
+        new_obstacles = {tuple(c) for c in obstacle_cells} - self.obstacles
+        self.obstacles |= new_obstacles
+        if new_obstacles:
             # 新增永久障碍：版本号递增，触发路线缓存失效
             self.obstacle_revision += 1
             self._dirty = True
@@ -160,6 +160,7 @@ class MapMemory:
                 if cell in vis and cell not in res:
                     del self.resource_seen[cell]
                     self._dirty = True
+        return new_obstacles
 
     # ---------- 敌方感知 ----------
     def observe_enemies(self, tick: int, enemy_cores, visible_cells=None) -> int:

@@ -779,17 +779,37 @@ class HybridPathPlanner:
         self._failed_goals: dict[str, set] = {}
 
     # ---------- Tick 生命周期 ----------
-    def begin_tick(self, map_version: int, is_known=None) -> None:
-        """每 Tick 调用：刷新地图版本与总预算；版本变化即丢弃全部路线。"""
+    def begin_tick(self, map_version: int, is_known=None, new_obstacles=None) -> None:
+        """每 Tick 调用：刷新地图版本与总预算。
+
+        版本变化时：给出 new_obstacles 则只丢弃剩余路径经过新障碍的路线
+        （其余路线把版本号对齐后继续沿用）；未给出则退回全清。
+        静态缓存与失败记录不分辨路径，版本变化一律清空。
+        多 Worker 扫图时几乎每 Tick 都有新障碍，全清会让路线游标形同虚设，
+        单位每 Tick 从头决策，两层规划意见相反时就成了永久振荡。
+        """
         version_changed = map_version != self.map_version
         self.map_version = map_version
         self.is_known = is_known
         self._budget_left = self.total_path_budget
-        if version_changed:
-            self.stats.invalidated += len(self.routes) + self.cache.clear()
+        if not version_changed:
+            return
+        self.stats.invalidated += self.cache.clear()
+        self._failed_goals.clear()
+        self._fast_blocks.clear()
+        if new_obstacles is None:
+            self.stats.invalidated += len(self.routes)
             self.routes.clear()
-            self._failed_goals.clear()
-            self._fast_blocks.clear()
+            return
+        blocked = {tuple(c) for c in new_obstacles}
+        for wid, route in list(self.routes.items()):
+            remaining = steps_to_cells(route.cell_at(route.next_index),
+                                       route.steps[route.next_index:])
+            if any(c in blocked for c in remaining):
+                self.routes.pop(wid)
+                self.stats.invalidated += 1
+            else:
+                route.map_version = map_version
 
     def stats_snapshot(self) -> dict:
         return self.stats.snapshot()
@@ -1015,6 +1035,17 @@ class HybridPathPlanner:
         best = min(portals, key=lambda pr: (manhattan(start, pr[0]) + manhattan(pr[1], goal),
                                             pr[0][1], pr[0][0]))
         portal = best[0]
+        if start == portal:
+            # 已站在门户上：直接迈进下一区块的对面格。若在此返回 None 退回全局
+            # A*，两层可能给出相反方向，单位会在门户两侧来回振荡。
+            entry = best[1]
+            if entry in obstacles or entry in occupied or entry in forbidden:
+                return None
+            d = next(k for k, v in DELTA.items()
+                     if (start[0] + v[0], start[1] + v[1]) == entry)
+            self.routes.pop(worker_id, None)
+            return PathResult(FOUND, (d,), entry, 0, 1, self.map_version,
+                              reason="chunk_portal_cross")
         if self._budget_left <= 0:
             return None
         cache_key = None

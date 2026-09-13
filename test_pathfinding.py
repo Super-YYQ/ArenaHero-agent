@@ -269,6 +269,47 @@ def test_bfs_frontier_deterministic():
     assert r1 == r2
 
 
+# ---------- Bug 1：军事单位两格振荡（跨区块门户 / 全清失效 / 无禁回头） ----------
+
+def _two_chunk_index():
+    """两个相邻已知区块 (0,0)/(1,0)，全部空地，供跨区块门户测试。"""
+    from pathfinding import CHUNK_SIZE, ChunkNavigationIndex
+    idx = ChunkNavigationIndex()
+    cells = [(x, y) for x in range(0, 2 * CHUNK_SIZE) for y in range(CHUNK_SIZE)]
+    idx.observe(cells, set())
+    return idx
+
+
+def test_cross_chunk_step_on_portal_advances_into_next_chunk():
+    """单位正好站在门户格上时，跨区块层必须直接迈入下一区块，
+    不能返回 None 退回全局 A*（两层意见相反会导致来回振荡）。"""
+    from pathfinding import CHUNK_SIZE, HybridPathPlanner
+    idx = _two_chunk_index()
+    p = HybridPathPlanner(fast_path_distance=0, chunk_index=idx)
+    p.begin_tick(0, is_known=idx.is_known)
+    start = (CHUNK_SIZE - 1, 5)      # 区块 (0,0) 东边界 = 门户 exit 格
+    goal = (2 * CHUNK_SIZE - 2, 5)   # 区块 (1,0) 深处
+    r = p.next_step("u", start, goal, obstacles=frozenset(), occupied=frozenset(),
+                    goal_kind="scout")
+    assert r.steps and r.steps[0] == "RIGHT", r
+    assert r.reason.startswith("chunk"), r.reason
+
+
+def test_new_obstacle_only_invalidates_routes_it_touches():
+    """远处新增障碍不应清空与之无关的路线游标。"""
+    from pathfinding import HybridPathPlanner
+    p = HybridPathPlanner(fast_path_distance=0)
+    p.begin_tick(0)
+    r = p.next_step("u", (0, 0), (0, 6), obstacles=frozenset(), occupied=frozenset())
+    assert r.reason == "astar" and "u" in p.routes
+    # 地图版本变了，但新增障碍在 (50, 50)，与路线无关
+    p.begin_tick(1, new_obstacles={(50, 50)})
+    assert "u" in p.routes, "无关障碍不应使路线失效"
+    # 新增障碍落在剩余路径上：必须失效
+    p.begin_tick(2, new_obstacles={(0, 3)})
+    assert "u" not in p.routes, "路径上的新障碍必须使路线失效"
+
+
 def load_tests(loader, tests, pattern):
     """让 `python -m unittest discover` 也能执行本文件的普通函数测试。"""
     import unittest
